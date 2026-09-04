@@ -24,7 +24,7 @@ from lightgbm import LGBMClassifier, early_stopping, log_evaluation
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import log_loss
 
-from app.base_model import (
+from app.ml.models.base_model import (
     BetHeroBaseModel,
     CalibrationMethod,
     PredictionBatch,
@@ -195,7 +195,7 @@ class LightGBMBetModel(BetHeroBaseModel):
              "classes": self._classes, "feature_names": self._feature_names},
             tmp,
         )
-        tmp.rename(path)
+        tmp.replace(path)  # atomic overwrite (Path.rename fails on Windows if dest exists)
         self._write_metadata_sidecar(path)
         logger.info("[LGB] Saved → %s", path)
         return path

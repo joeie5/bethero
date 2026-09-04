@@ -36,7 +36,7 @@ from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import log_loss
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
-from app.base_model import (
+from app.ml.models.base_model import (
     BetHeroBaseModel,
     CalibrationMethod,
     PredictionBatch,
@@ -343,14 +343,14 @@ class LSTMBetModel(BetHeroBaseModel):
             "n_cls":   self._n_cls, "clss":  self._classes,
             "feats":   self._feature_names, "cal": self._calibrated,
         }, tmp)
-        tmp.rename(path)
+        tmp.replace(path)  # atomic overwrite (Path.rename fails on Windows if dest exists)
         self._write_metadata_sidecar(path)
         logger.info("[LSTM] Saved → %s", path)
         return path
 
     def load(self, path: Path) -> None:
         self._read_metadata_sidecar(path)
-        c = torch.load(path, map_location="cpu")
+        c = torch.load(path, map_location="cpu", weights_only=False)  # our own checkpoint, trusted
         self.hidden, self.n_layers   = c["hidden"], c["n_layers"]
         self.dropout, self.seq_len   = c["dropout"], c["seq_len"]
         self._n_cls, self._classes   = c["n_cls"], c["clss"]

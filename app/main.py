@@ -69,15 +69,41 @@ async def start_scheduler():
         hour=7,
         minute=0
     )
+    scheduler.add_job(
+        resolve_results,
+        'interval',
+        hours=2,
+    )
     scheduler.start()
 
 async def daily_predictions():
     print("Running daily prediction generation...")
+    import asyncio
+    from app.database import get_supabase_admin
     from app.ingestion.fixture_fetcher import fetch_all_fixtures
-    from app.services.accumulator_builder import build_all_accumulators
+    from app.ml.predictor import Predictor
+    from app.ml.accumulator_builder import run_accumulator_job
+
     await fetch_all_fixtures()
-    await build_all_accumulators()
+
+    # Generate predictions for upcoming fixtures — nothing else in this job
+    # actually creates prediction rows; without this, run_accumulator_job()
+    # below has nothing to build tickets from and predictions stays empty.
+    def _generate_predictions():
+        client = get_supabase_admin()
+        results = Predictor(client).predict_upcoming()
+        print(f"Generated {len(results)} predictions")
+    await asyncio.to_thread(_generate_predictions)
+
+    await asyncio.to_thread(run_accumulator_job)
     print("Daily predictions complete")
+
+async def resolve_results():
+    print("Running result resolution...")
+    import asyncio
+    from app.ingestion.result_fetcher import ResultFetcher
+    await asyncio.to_thread(ResultFetcher().run)
+    print("Result resolution complete")
 
 app.include_router(predictions.router)
 app.include_router(results.router)

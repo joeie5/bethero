@@ -1,9 +1,27 @@
-from fastapi import APIRouter, BackgroundTasks
+import os
+import secrets
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Header
 from app.database import get_supabase_admin
 
 supabase = get_supabase_admin()
 
-router = APIRouter(prefix="/admin", tags=["Admin"])
+
+async def require_admin_key(x_admin_api_key: str | None = Header(default=None)) -> None:
+    """
+    Gate every /admin route behind a shared-secret header.
+
+    ADMIN_API_KEY must be set in the environment — if it isn't, every request
+    is rejected rather than silently allowed through (fail closed, not open).
+    """
+    expected = os.getenv("ADMIN_API_KEY")
+    if not expected:
+        raise HTTPException(status_code=503, detail="Admin API is not configured (ADMIN_API_KEY unset).")
+    if not x_admin_api_key or not secrets.compare_digest(x_admin_api_key, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Api-Key header.")
+
+
+router = APIRouter(prefix="/admin", tags=["Admin"], dependencies=[Depends(require_admin_key)])
 
 @router.get("/import/status")
 async def import_status():
@@ -158,29 +176,36 @@ SPORT_ALIASES = {
     "nhl": "nhl",
 }
 
+def _train_all_markets(sport: str) -> None:
+    from app.ml.predictor import MARKET_SPEC
+    from app.ml.training_pipeline_logic import train_market
+    for model_key in MARKET_SPEC:
+        for line_spec in MARKET_SPEC[model_key].get("lines", [{"model_key": model_key}]):
+            train_market(sport, line_spec.get("model_key", model_key))
+
+
 @router.get("/train/{sport}")
 async def trigger_training(
     sport: str,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    market: str | None = None,
 ):
     try:
         mapped_sport = SPORT_ALIASES.get(sport, sport)
-        if mapped_sport == "all":
-            from app.ml.training_pipeline import (
-                train_all_models
-            )
-            background_tasks.add_task(train_all_models)
-        else:
-            from app.ml.training_pipeline import (
-                train_sport_models
-            )
-            background_tasks.add_task(
-                train_sport_models, mapped_sport
-            )
+        if market:
+            from app.ml.training_pipeline_logic import train_market
+            background_tasks.add_task(train_market, mapped_sport, market)
+            return {
+                "status": "started",
+                "sport": mapped_sport,
+                "market": market,
+                "message": f"Training {mapped_sport}/{market}"
+            }
+        background_tasks.add_task(_train_all_markets, mapped_sport)
         return {
             "status": "started",
             "sport": mapped_sport,
-            "message": f"Training {mapped_sport} models"
+            "message": f"Training all markets for {mapped_sport}"
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -283,10 +308,8 @@ async def generate_accumulators(
     background_tasks: BackgroundTasks
 ):
     try:
-        from app.services.accumulator_builder import (
-            build_all_accumulators
-        )
-        background_tasks.add_task(build_all_accumulators)
+        from app.ml.accumulator_builder import run_accumulator_job
+        background_tasks.add_task(run_accumulator_job)
         return {
             "status": "started",
             "message": "Building real accumulators"
@@ -390,25 +413,16 @@ async def generate_accumulators_debug():
     
     # Step 3 - Try prediction
     try:
-        from app.ml.training_pipeline import predict_match
+        from app.ml.predictor import Predictor
         f = fixtures.data[0]
-        pred = predict_match(
-            f.get("home_team",""),
-            f.get("away_team",""),
-            f.get("sport","football"),
-            f.get("home_odds", 2.0),
-            f.get("away_odds", 2.0),
-            f.get("draw_odds", 3.0)
-        )
-        results["prediction_test"] = pred
+        pred = Predictor(supabase).predict_match(f.get("sport", "football"), f.get("fixture_id"), persist=False)
+        results["prediction_test"] = [r.__dict__ for r in pred]
     except Exception as e:
         results["prediction_error"] = str(e)
     
     # Step 4 - Check accumulator builder import
     try:
-        from app.services.accumulator_builder import (
-            build_all_accumulators
-        )
+        from app.ml.accumulator_builder import run_accumulator_job
         results["builder_import"] = "success"
     except Exception as e:
         results["builder_import_error"] = str(e)

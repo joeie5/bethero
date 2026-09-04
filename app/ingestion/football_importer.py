@@ -1,24 +1,35 @@
 """
-football_importer.py — Imports historical football data from:
-  - stats/football/ (handles European leagues Kaggle dataset,
-    Football-Data.co.uk CSVs, and any generic CSV with home/away columns)
+football_importer.py — Imports historical football data from
+work/backtest_web/data/football/<country>/<league>.csv (football-data.co.uk
+Main-tier and Extra-tier exports — see CLAUDE.md §5).
 
-Supported column families:
-  - Football-Data.co.uk  : Date, HomeTeam, AwayTeam, FTHG, FTAG, Div, Season
-  - Kaggle European Soccer: match_api_id, date, home_team_api_id (resolved via team lookup)
-  - Generic              : home_team/away_team or home/away + date columns
+Tier detection (per file, not per country — some countries only have one)
+---------------------------------------------------------------------------
+Main tier  : has HC/AC/HY/AY/HR/AR/HS/AS/HST/AST — full post-match stats,
+             supports all four §2 markets (BTTS, Goals, Corners, Cards).
+Extra tier : only HG/AG/Res — supports BTTS/Goals only (both derivable from
+             goals alone); Corners/Cards stay null, never fabricated.
 
-The importer auto-detects the format and dispatches accordingly.
+Column reference
+-----------------
+Main tier : Div,Date,HomeTeam,AwayTeam,FTHG,FTAG,FTR,HTHG,HTAG,HTR,Referee,
+            HS,AS,HST,AST,HC,AC,HY,AY,HR,AR, + many bookmaker odds columns
+            (B365H/D/A, PSH/D/A, PSCH/D/A, AvgH/D/A, MaxH/D/A,
+             B365>2.5/B365<2.5, Avg>2.5/Avg<2.5, ...)
+Extra tier: Country,League,Season,Date,Time,Home,Away,HG,AG,Res, +
+            closing-odds-only columns (PSCH/D/A, MaxCH/D/A, AvgCH/D/A,
+             BFECH/D/A, B365CH/D/A) — no opening odds, no O/U lines.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import pandas as pd
 
-from app.base_importer import BaseImporter
+from app.ingestion.base_importer import BaseImporter
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +40,11 @@ DIVISION_MAP: dict[str, tuple[str, str]] = {
     "E1":  ("Championship",          "England"),
     "E2":  ("League One",            "England"),
     "E3":  ("League Two",            "England"),
-    "EC":  ("Conference",            "England"),
+    "EC":  ("National League",       "England"),
     "SC0": ("Scottish Premiership",  "Scotland"),
     "SC1": ("Scottish Championship", "Scotland"),
+    "SC2": ("Scottish League One",   "Scotland"),
+    "SC3": ("Scottish League Two",   "Scotland"),
     "D1":  ("Bundesliga",            "Germany"),
     "D2":  ("2. Bundesliga",         "Germany"),
     "SP1": ("La Liga",               "Spain"),
@@ -47,155 +60,186 @@ DIVISION_MAP: dict[str, tuple[str, str]] = {
     "G1":  ("Super League",          "Greece"),
 }
 
-# Common team aliases (expand as needed from your actual data)
 FOOTBALL_ALIASES: dict[str, str] = {
-    "man utd":               "manchester united",
-    "man united":            "manchester united",
-    "man city":              "manchester city",
-    "spurs":                 "tottenham hotspur",
-    "tottenham":             "tottenham hotspur",
-    "wolves":                "wolverhampton wanderers",
-    "brighton":              "brighton & hove albion",
-    "sheffield utd":         "sheffield united",
-    "sheffield wednesddays": "sheffield wednesday",
-    "nottm forest":          "nottingham forest",
-    "qpr":                   "queens park rangers",
-    "west brom":             "west bromwich albion",
-    "palace":                "crystal palace",
-    "brentford fc":          "brentford",
-    "newcastle":             "newcastle united",
-    "leicester":             "leicester city",
-    "norwich":               "norwich city",
-    "watford fc":            "watford",
-    "west ham":              "west ham united",
-    "atletico":              "atletico madrid",
-    "atl madrid":            "atletico madrid",
-    "real":                  "real madrid",
-    "barca":                 "barcelona",
-    "fc barcelona":          "barcelona",
-    "fcb":                   "barcelona",
-    "inter":                 "inter milan",
-    "inter milan":           "inter milan",
-    "ac milan":              "milan",
-    "psv":                   "psv eindhoven",
-    "ajax":                  "ajax amsterdam",
-    "dortmund":              "borussia dortmund",
-    "bvb":                   "borussia dortmund",
-    "gladbach":              "borussia monchengladbach",
-    "rb leipzig":            "rasenballsport leipzig",
-    "leverkusen":            "bayer leverkusen",
+    "man utd": "manchester united", "man united": "manchester united",
+    "man city": "manchester city", "spurs": "tottenham hotspur",
+    "tottenham": "tottenham hotspur", "wolves": "wolverhampton wanderers",
+    "brighton": "brighton & hove albion", "sheffield utd": "sheffield united",
+    "nottm forest": "nottingham forest", "qpr": "queens park rangers",
+    "west brom": "west bromwich albion", "newcastle": "newcastle united",
+    "leicester": "leicester city", "norwich": "norwich city",
+    "west ham": "west ham united", "atletico": "atletico madrid",
+    "real": "real madrid", "barca": "barcelona", "inter": "inter milan",
+    "ac milan": "milan", "psv": "psv eindhoven", "ajax": "ajax amsterdam",
+    "dortmund": "borussia dortmund", "bvb": "borussia dortmund",
+    "leverkusen": "bayer leverkusen",
 }
+
+MAIN_TIER_MARKERS = {"hc", "ac", "hy", "ay", "hr", "ar", "hs", "as", "hst", "ast"}
+
+# (bookmaker_label, home_col, draw_col, away_col) cascades, most preferred first
+MAIN_1X2_CASCADE = [
+    ("Pinnacle", "psh", "psd", "psa"),
+    ("Bet365",   "b365h", "b365d", "b365a"),
+    ("Average",  "avgh", "avgd", "avga"),
+]
+MAIN_OU25_CASCADE = [
+    ("Bet365",  "b365>2.5", "b365<2.5"),
+    ("Average", "avg>2.5",  "avg<2.5"),
+]
+EXTRA_1X2_CASCADE = [
+    ("Pinnacle", "psch", "pscd", "psca"),
+    ("Average",  "avgch", "avgcd", "avgca"),
+    ("Bet365",   "b365ch", "b365cd", "b365ca"),
+]
 
 
 class FootballImporter(BaseImporter):
 
     sport_slug = "football"
 
-    async def download_from_storage(self):
-        """Downloads all files for football from Supabase Storage"""
-        import os
-        files = self.client.storage.from_("sports-data").list(self.sport_slug)
-        
-        local_dir = f"/tmp/stats/{self.sport_slug}"
-        os.makedirs(local_dir, exist_ok=True)
-        
-        for file in files:
-            file_path = f"{self.sport_slug}/{file['name']}"
-            data = self.client.storage.from_("sports-data").download(file_path)
-            
-            local_file = f"{local_dir}/{file['name']}"
-            with open(local_file, "wb") as f:
-                f.write(data)
-            logger.info("Downloaded %s", file_path)
-        
-        self.data_dir = Path(local_dir)
-        return local_dir
-
     def load_aliases(self) -> dict[str, str]:
         return FOOTBALL_ALIASES
 
     def normalize(self, df: pd.DataFrame, source_file: Path) -> pd.DataFrame:
         df = self._clean_df(df)
-        cols = {c.lower() for c in df.columns}
-
-        # ── Format detection ───────────────────────────────────
-        if "hometeam" in cols and "awayteam" in cols:
-            return self._normalize_football_data(df)
-        elif "home_team_api_id" in cols:
-            return self._normalize_kaggle(df)
-        else:
-            return self._normalize_generic(df)
-
-    # ── Football-Data.co.uk format ──────────────────────────────
-    def _normalize_football_data(self, df: pd.DataFrame) -> pd.DataFrame:
         df.columns = [c.lower().strip() for c in df.columns]
+        cols = set(df.columns)
+
+        if "hometeam" in cols and "awayteam" in cols:
+            return self._normalize_main_tier(df)
+        elif "home" in cols and "away" in cols:
+            return self._normalize_extra_tier(df)
+        else:
+            logger.warning("Unrecognised football file format: %s (%s)", source_file, sorted(cols)[:15])
+            return pd.DataFrame()
+
+    # ── Main tier (football-data.co.uk primary league pages) ─────
+
+    def _normalize_main_tier(self, df: pd.DataFrame) -> pd.DataFrame:
+        is_main = bool(MAIN_TIER_MARKERS & set(df.columns))
         rows = []
         for _, r in df.iterrows():
-            date_val = r.get("date") or r.get("dateymd")
-            div = str(r.get("div", "")).strip()
+            date_val = r.get("date")
+            if not date_val or pd.isna(date_val):
+                continue
+            parsed = self._parse_date(str(date_val))
+            div_raw = r.get("div")
+            div = "" if div_raw is None or pd.isna(div_raw) else str(div_raw).strip()
             league_name, country = DIVISION_MAP.get(div, ("Unknown League", ""))
+
+            fthg, ftag = self._safe_int(r.get("fthg")), self._safe_int(r.get("ftag"))
+            extra_stats: dict = {}
+            odds: list[dict] = []
+
+            if is_main and fthg is not None and ftag is not None:
+                hc, ac = self._safe_int(r.get("hc")), self._safe_int(r.get("ac"))
+                hy, ay = self._safe_int(r.get("hy")), self._safe_int(r.get("ay"))
+                hr, ar = self._safe_int(r.get("hr")), self._safe_int(r.get("ar"))
+                hst, ast = self._safe_int(r.get("hst")), self._safe_int(r.get("ast"))
+                hthg, htag = self._safe_int(r.get("hthg")), self._safe_int(r.get("htag"))
+
+                if hc is not None and ac is not None:
+                    extra_stats["home_corners"] = hc
+                    extra_stats["away_corners"] = ac
+                    extra_stats["total_corners"] = hc + ac
+                if hy is not None and ay is not None and hr is not None and ar is not None:
+                    extra_stats["total_yellow"] = hy + ay
+                    extra_stats["total_red"] = hr + ar
+                    extra_stats["total_cards"] = hy + ay + hr + ar
+                if hst is not None and ast is not None:
+                    extra_stats["home_sot"] = hst
+                    extra_stats["away_sot"] = ast
+                    extra_stats["total_sot"] = hst + ast
+                if hthg is not None and htag is not None:
+                    extra_stats["ht_home_goals"] = hthg
+                    extra_stats["ht_away_goals"] = htag
+                    extra_stats["htr"] = "H" if hthg > htag else ("A" if htag > hthg else "D")
+
+                odds = self._extract_main_odds(r)
+
             rows.append({
                 "home_team_name": str(r.get("hometeam", "")),
                 "away_team_name": str(r.get("awayteam", "")),
                 "match_date":     str(date_val),
+                "league_key":     div or "unknown",
                 "league_name":    league_name,
                 "country":        country,
-                "season":         str(r.get("season", "")),
-                "home_score":     r.get("fthg"),
-                "away_score":     r.get("ftag"),
-                "status":         "finished",
+                "season":         self._season_from_date(parsed),
+                "home_score":     fthg,
+                "away_score":     ftag,
+                "status":         "FT",
+                "extra_stats":    extra_stats,
+                "odds":           odds,
             })
         return pd.DataFrame(rows)
 
-    # ── Kaggle European Soccer DB format ───────────────────────
-    def _normalize_kaggle(self, df: pd.DataFrame) -> pd.DataFrame:
-        df.columns = [c.lower().strip() for c in df.columns]
-        # Kaggle stores team API IDs — we'll use them as names with prefix
-        # so they still get created as unique teams in the DB
+    def _extract_main_odds(self, r: pd.Series) -> list[dict]:
+        odds = []
+        for bookmaker, hcol, dcol, acol in MAIN_1X2_CASCADE:
+            h, d, a = self._safe_float(r.get(hcol)), self._safe_float(r.get(dcol)), self._safe_float(r.get(acol))
+            if h and d and a:
+                odds.append({
+                    "bookmaker": bookmaker, "market": "1X2",
+                    "home_odds": h, "draw_odds": d, "away_odds": a,
+                })
+                break
+        for bookmaker, ocol, ucol in MAIN_OU25_CASCADE:
+            o, u = self._safe_float(r.get(ocol)), self._safe_float(r.get(ucol))
+            if o and u:
+                odds.append({
+                    "bookmaker": bookmaker, "market": "Over_Under_Goals", "line": 2.5,
+                    "over_odds": o, "under_odds": u,
+                })
+                break
+        return odds
+
+    # ── Extra tier (football-data.co.uk combined "extra leagues" files) ──
+
+    def _normalize_extra_tier(self, df: pd.DataFrame) -> pd.DataFrame:
         rows = []
         for _, r in df.iterrows():
+            date_val = r.get("date")
+            if not date_val or pd.isna(date_val):
+                continue
+            parsed = self._parse_date(str(date_val))
+            hg, ag = self._safe_int(r.get("hg")), self._safe_int(r.get("ag"))
+
+            odds: list[dict] = []
+            for bookmaker, hcol, dcol, acol in EXTRA_1X2_CASCADE:
+                h, d, a = self._safe_float(r.get(hcol)), self._safe_float(r.get(dcol)), self._safe_float(r.get(acol))
+                if h and d and a:
+                    odds.append({
+                        "bookmaker": bookmaker, "market": "1X2",
+                        "home_odds": h, "draw_odds": d, "away_odds": a,
+                    })
+                    break
+
+            season_raw = str(r.get("season", "") or "")
+            season_match = re.match(r"(\d{4})", season_raw)
+            season = int(season_match.group(1)) if season_match else self._season_from_date(parsed)
+
             rows.append({
-                "home_team_name": f"team_{r.get('home_team_api_id', 'unk')}",
-                "away_team_name": f"team_{r.get('away_team_api_id', 'unk')}",
-                "match_date":     str(r.get("date", "")),
-                "league_name":    str(r.get("league_id", "Unknown")),
-                "country":        str(r.get("country_id", "")),
-                "season":         str(r.get("season", "")),
-                "home_score":     r.get("home_team_goal"),
-                "away_score":     r.get("away_team_goal"),
-                "status":         "finished",
+                "home_team_name": str(r.get("home", "")),
+                "away_team_name": str(r.get("away", "")),
+                "match_date":     str(date_val),
+                "league_key":     str(r.get("league", "unknown")).strip() or "unknown",
+                "league_name":    str(r.get("league", "Unknown")).strip() or "Unknown",
+                "country":        str(r.get("country", "")).strip(),
+                "season":         season,
+                "home_score":     hg,
+                "away_score":     ag,
+                "status":         "FT",
+                "extra_stats":    {},   # no corners/cards in Extra tier — never fabricated
+                "odds":           odds,
             })
         return pd.DataFrame(rows)
 
-    # ── Generic / fallback format ──────────────────────────────
-    def _normalize_generic(self, df: pd.DataFrame) -> pd.DataFrame:
-        df.columns = [c.lower().strip() for c in df.columns]
-        col = df.columns.tolist()
+    # ── Utility ────────────────────────────────────────────────
 
-        home_col  = next((c for c in col if "home" in c and "team" in c), None) or \
-                    next((c for c in col if c in ("home", "home_team")), None)
-        away_col  = next((c for c in col if "away" in c and "team" in c), None) or \
-                    next((c for c in col if c in ("away", "away_team")), None)
-        date_col  = next((c for c in col if "date" in c), None)
-        hg_col    = next((c for c in col if c in ("hg", "home_goals", "home_score", "fthg", "ghome")), None)
-        ag_col    = next((c for c in col if c in ("ag", "away_goals", "away_score", "ftag", "gaway")), None)
-        league_col = next((c for c in col if "league" in c or "div" in c or "comp" in c), None)
-        season_col = next((c for c in col if "season" in c or "year" in c), None)
-
-        if not home_col or not away_col or not date_col:
-            logger.warning("Cannot normalise file — missing home/away/date columns: %s", col)
-            return pd.DataFrame()
-
-        rows = []
-        for _, r in df.iterrows():
-            rows.append({
-                "home_team_name": str(r.get(home_col, "")),
-                "away_team_name": str(r.get(away_col, "")),
-                "match_date":     str(r.get(date_col, "")),
-                "league_name":    str(r.get(league_col, "Football")) if league_col else "Football",
-                "season":         str(r.get(season_col, "")) if season_col else "",
-                "home_score":     r.get(hg_col) if hg_col else None,
-                "away_score":     r.get(ag_col) if ag_col else None,
-                "status":         "finished",
-            })
-        return pd.DataFrame(rows)
+    @staticmethod
+    def _season_from_date(dt) -> int | None:
+        """Football season label = year the season started (Aug-Jul cycle)."""
+        if dt is None:
+            return None
+        return dt.year if dt.month >= 7 else dt.year - 1

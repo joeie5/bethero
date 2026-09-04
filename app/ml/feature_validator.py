@@ -235,7 +235,7 @@ class FeatureValidator:
         self._check_duplicate_rows(X_train, report)
         self._check_target_distribution(y_train, y_val, report)
         report.feature_stats   = self._compute_feature_stats(X_train, X_val)
-        report.correlation_top = self._compute_correlations(X_all, y_all, report)
+        # report.correlation_top is already set by _check_target_leakage() above.
         report.ks_results      = self._check_distribution_shift(X_train, X_val, report)
 
         # ── Final pass/fail ───────────────────────────────────────

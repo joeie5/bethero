@@ -421,7 +421,6 @@ class BetHeroBaseModel(ABC):
         from sklearn.metrics import (
             accuracy_score, log_loss, brier_score_loss, roc_auc_score
         )
-        from sklearn.preprocessing import label_binarize
 
         if len(X) < min_train_rows + 50:
             raise ValueError(
@@ -471,7 +470,9 @@ class BetHeroBaseModel(ABC):
                 classes = self._classes
                 le_map  = {c: i for i, c in enumerate(classes)}
                 y_enc   = y_te.map(le_map).fillna(0).astype(int)
-                y_bin   = label_binarize(y_enc, classes=list(range(len(classes))))
+                # np.eye one-hot, not label_binarize (collapses to 1 column for
+                # exactly 2 classes) — every market in this system is binary.
+                y_bin   = np.eye(len(classes))[y_enc.values]
 
                 acc  = accuracy_score(y_te, preds)
                 ll   = log_loss(y_te, proba, labels=classes)
@@ -578,7 +579,6 @@ class BetHeroBaseModel(ABC):
     ) -> dict[str, float]:
         """Compute standard classification metrics; return as dict."""
         from sklearn.metrics import accuracy_score, log_loss, brier_score_loss, roc_auc_score
-        from sklearn.preprocessing import label_binarize
 
         le_map = {c: i for i, c in enumerate(classes)}
         y_enc  = y_true.map(le_map).fillna(0).astype(int)
@@ -587,7 +587,10 @@ class BetHeroBaseModel(ABC):
         acc   = accuracy_score(y_true, preds)
         ll    = log_loss(y_true, proba, labels=classes)
 
-        y_bin = label_binarize(y_enc, classes=list(range(len(classes))))
+        # np.eye one-hot (not sklearn's label_binarize, which collapses to a
+        # single column for exactly 2 classes) so this works for binary and
+        # multiclass alike — every market in this system is binary.
+        y_bin = np.eye(len(classes))[y_enc.values]
         bs    = float(np.mean([brier_score_loss(y_bin[:, i], proba[:, i])
                                for i in range(len(classes))]))
         try:

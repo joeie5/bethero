@@ -4,34 +4,47 @@ feature_engineer.py — Complete pre-match feature pipeline for Bet Hero ML mode
 ⚠️  NO DATA LEAKAGE GUARANTEE
 All features are computed using only data with timestamp < match_date.
 This is enforced by the strict date filtering in every query and rolling window.
+None of match_results' post-match columns (home_goals, away_goals, ht_home_goals,
+ht_away_goals, ftr, htr, home_sot, away_sot, home_corners, away_corners,
+total_yellow, total_red, total_cards, ...) are ever used as same-match features —
+only as (a) the training label, or (b) folded into rolling history for matches
+strictly before the one being predicted.
+
+Live schema (verified against the `bethero` Supabase project)
+----------------------------------------------------------------
+    fixtures        PK (sport, fixture_id)   — scheduling/context, no scores
+    match_results   PK (sport, fixture_id)   — post-match stats (label source)
+    team_form_cache PK (sport, team_id, as_of_date) — pre-aggregated rolling stats
+    fixture_odds    — bookmaker odds per (sport, fixture_id, bookmaker, market)
 
 Feature families
 ----------------
-1. FORM          — rolling 5 / 10 / 20 game windows, exp-decay score, momentum
-2. STRENGTH      — Elo differential, Dixon-Coles attack/defense strengths
+1. FORM          — rolling 5 / 10 / 20 game windows, exp-decay score, momentum,
+                    plus rolling corners/cards signal for the Corners/Cards markets
+2. STRENGTH      — Elo (from team_form_cache), Dixon-Coles attack/defense strengths
 3. HEAD-TO-HEAD  — win/draw/loss rate, goals, venue, days since last meeting
 4. CONTEXT       — fatigue, midweek flag, league position, season stage, importance
 5. MARKET        — implied probabilities (overround removed), odds movement
-6. REFEREE       — cards, fouls, home-win bias
+6. REFEREE       — reserved; no referee-stats table exists in the live schema yet,
+                    so this always returns zeroed features (fixtures.referee is a
+                    bare text name with no aggregated stats behind it)
 
 Public API
 ----------
     fe = FeatureEngineer(supabase_client)
-    row = fe.build(match_id)            # → dict[str, float]  (single match)
-    df  = fe.build_batch(match_ids)     # → pd.DataFrame      (multiple matches)
+    row = fe.build(sport, fixture_id)            # → dict[str, float]  (single match)
+    df  = fe.build_batch([(sport, fixture_id), ...])  # → pd.DataFrame
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 import numpy as np
 import pandas as pd
-
-from app.elo_calculator import get_elo_at_date, STARTING_RATING
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +54,7 @@ FORM_WINDOWS        = [5, 10, 20]
 EXP_DECAY_HALFLIFE  = 10          # games: weight halves every 10 games ago
 H2H_LOOKBACK        = 6           # last N H2H meetings
 NAN_FILL            = 0.0         # sentinel for missing numeric features
+STARTING_ELO        = 1500.0      # fallback when team_form_cache has no row yet
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -67,7 +81,8 @@ class FormCalculator:
         ----------
         team_matches : DataFrame with columns:
             match_date, is_home, goals_for, goals_against,
-            result (W/D/L), xg_for, xga, clean_sheet, btts, over25
+            result (W/D/L), corners_for, corners_against, cards_total,
+            clean_sheet, btts, over25
             Ordered by match_date ASC.
         """
         self.df = team_matches.copy()
@@ -84,13 +99,13 @@ class FormCalculator:
             p = f"{prefix}_form{w}_"
             n = len(window)
             if n == 0:
-                # Fill zeros for all expected features in this window
                 feats.update({
                     f"{p}ppg": NAN_FILL,
                     f"{p}gscored": NAN_FILL,
                     f"{p}gconceded": NAN_FILL,
-                    f"{p}xg": NAN_FILL,
-                    f"{p}xga": NAN_FILL,
+                    f"{p}corners_for": NAN_FILL,
+                    f"{p}corners_against": NAN_FILL,
+                    f"{p}cards_total": NAN_FILL,
                     f"{p}cs_rate": NAN_FILL,
                     f"{p}btts_rate": NAN_FILL,
                     f"{p}over25_rate": NAN_FILL,
@@ -105,17 +120,18 @@ class FormCalculator:
             losses = (window["result"] == "L").sum()
             points = wins * 3 + draws
 
-            feats[f"{p}ppg"]        = _safe_div(points, n)
-            feats[f"{p}gscored"]    = window["goals_for"].mean()
-            feats[f"{p}gconceded"]  = window["goals_against"].mean()
-            feats[f"{p}xg"]         = window["xg_for"].mean()   if "xg_for" in window else NAN_FILL
-            feats[f"{p}xga"]        = window["xga"].mean()       if "xga"    in window else NAN_FILL
-            feats[f"{p}cs_rate"]    = _safe_div(window["clean_sheet"].sum(), n)
-            feats[f"{p}btts_rate"]  = _safe_div(window["btts"].sum(), n)
-            feats[f"{p}over25_rate"]= _safe_div(window["over25"].sum(), n)
-            feats[f"{p}win_pct"]    = _safe_div(wins,   n)
-            feats[f"{p}draw_pct"]   = _safe_div(draws,  n)
-            feats[f"{p}loss_pct"]   = _safe_div(losses, n)
+            feats[f"{p}ppg"]            = _safe_div(points, n)
+            feats[f"{p}gscored"]        = window["goals_for"].mean()
+            feats[f"{p}gconceded"]      = window["goals_against"].mean()
+            feats[f"{p}corners_for"]    = window["corners_for"].mean()     if "corners_for"     in window else NAN_FILL
+            feats[f"{p}corners_against"]= window["corners_against"].mean()if "corners_against" in window else NAN_FILL
+            feats[f"{p}cards_total"]    = window["cards_total"].mean()     if "cards_total"     in window else NAN_FILL
+            feats[f"{p}cs_rate"]        = _safe_div(window["clean_sheet"].sum(), n)
+            feats[f"{p}btts_rate"]      = _safe_div(window["btts"].sum(), n)
+            feats[f"{p}over25_rate"]    = _safe_div(window["over25"].sum(), n)
+            feats[f"{p}win_pct"]        = _safe_div(wins,   n)
+            feats[f"{p}draw_pct"]       = _safe_div(draws,  n)
+            feats[f"{p}loss_pct"]       = _safe_div(losses, n)
 
         # ── Exponential-decay form score ──────────────────────────
         feats[f"{prefix}_ewm_form"] = self._exp_decay_form(hist)
@@ -189,9 +205,9 @@ class DixonColesEstimator:
         Parameters
         ----------
         league_matches : DataFrame with home_team_id, away_team_id,
-                         home_score, away_score, match_date
+                         home_goals, away_goals, match_date
         """
-        self.df = league_matches.dropna(subset=["home_score", "away_score"]).copy()
+        self.df = league_matches.dropna(subset=["home_goals", "away_goals"]).copy()
         self._league_avg_home: float = 0.0
         self._league_avg_away: float = 0.0
         self._attack:  dict[int, float] = {}
@@ -202,8 +218,8 @@ class DixonColesEstimator:
         if hist.empty:
             return self
 
-        self._league_avg_home = hist["home_score"].mean()
-        self._league_avg_away = hist["away_score"].mean()
+        self._league_avg_home = hist["home_goals"].mean()
+        self._league_avg_away = hist["away_goals"].mean()
         league_avg = (self._league_avg_home + self._league_avg_away) / 2.0
 
         if league_avg == 0:
@@ -213,8 +229,8 @@ class DixonColesEstimator:
         for tid in teams:
             home_games  = hist[hist["home_team_id"] == tid]
             away_games  = hist[hist["away_team_id"] == tid]
-            goals_scored    = (home_games["home_score"].sum() + away_games["away_score"].sum())
-            goals_conceded  = (home_games["away_score"].sum() + away_games["home_score"].sum())
+            goals_scored    = (home_games["home_goals"].sum() + away_games["away_goals"].sum())
+            goals_conceded  = (home_games["away_goals"].sum() + away_games["home_goals"].sum())
             n_games = len(home_games) + len(away_games)
             if n_games > 0:
                 self._attack[tid]  = _safe_div(goals_scored  / n_games, league_avg, 1.0)
@@ -250,7 +266,8 @@ def compute_h2h_features(
 
     Parameters
     ----------
-    all_matches : DataFrame of all historical matches for the sport.
+    all_matches : DataFrame of all historical matches for the sport
+                  (fixtures joined with match_results).
     """
     h2h = all_matches[
         (
@@ -258,7 +275,7 @@ def compute_h2h_features(
             ((all_matches["home_team_id"] == away_id) & (all_matches["away_team_id"] == home_id))
         ) &
         (all_matches["match_date"] < before_dt) &
-        all_matches["home_score"].notna()
+        all_matches["home_goals"].notna()
     ].sort_values("match_date").tail(H2H_LOOKBACK)
 
     feats: dict[str, float] = {}
@@ -277,12 +294,12 @@ def compute_h2h_features(
     # Outcome from home team's perspective
     def _outcome(row):
         if row["home_team_id"] == home_id:
-            if row["home_score"] > row["away_score"]: return "W"
-            if row["home_score"] == row["away_score"]: return "D"
+            if row["home_goals"] > row["away_goals"]: return "W"
+            if row["home_goals"] == row["away_goals"]: return "D"
             return "L"
         else:
-            if row["away_score"] > row["home_score"]: return "W"
-            if row["away_score"] == row["home_score"]: return "D"
+            if row["away_goals"] > row["home_goals"]: return "W"
+            if row["away_goals"] == row["home_goals"]: return "D"
             return "L"
 
     h2h = h2h.copy()
@@ -295,7 +312,7 @@ def compute_h2h_features(
     feats["h2h_home_win_rate"] = _safe_div(wins,   n)
     feats["h2h_draw_rate"]     = _safe_div(draws,  n)
     feats["h2h_away_win_rate"] = _safe_div(losses, n)
-    feats["h2h_avg_goals"]     = ((h2h["home_score"] + h2h["away_score"]).mean())
+    feats["h2h_avg_goals"]     = ((h2h["home_goals"] + h2h["away_goals"]).mean())
 
     # H2H at same venue
     if venue:
@@ -337,7 +354,7 @@ def compute_context_features(
 
     Parameters
     ----------
-    match       : The upcoming match dict from DB
+    match       : The upcoming match dict from DB (fixtures row)
     team_hist   : All historical matches for this team (full history, date-sorted)
     league_table: {team_id: {position, points, top4_gap, relegation_gap}} at match time
     """
@@ -391,8 +408,6 @@ def compute_context_features(
 def _season_stage(dt: datetime, season: str) -> float:
     """Heuristic: map calendar month to season stage [0, 1]."""
     month = dt.month
-    # Football: season starts Aug (0) → ends May (1)
-    # NBA: Oct (0) → Jun (1)
     mapping = {8: 0.0, 9: 0.1, 10: 0.2, 11: 0.3, 12: 0.4,
                1: 0.5, 2: 0.6, 3: 0.7, 4: 0.8, 5: 0.9, 6: 1.0, 7: 1.0}
     return mapping.get(month, 0.5)
@@ -434,12 +449,12 @@ def _streak(results: list[str], target: str) -> int:
 
 def compute_market_features(odds_rows: list[dict]) -> dict[str, float]:
     """
-    Derive implied probabilities and odds movement signals.
+    Derive implied probabilities and odds movement signals from fixture_odds rows.
 
     Parameters
     ----------
-    odds_rows : List of odds_history rows for the match
-                (closing and opening odds from preferred bookmakers).
+    odds_rows : List of fixture_odds rows for the match (one or more pulls,
+                possibly at different pulled_at timestamps, for the 1X2 market).
     """
     feats: dict[str, float] = {
         "market_implied_home": NAN_FILL,
@@ -455,26 +470,25 @@ def compute_market_features(odds_rows: list[dict]) -> dict[str, float]:
     if not odds_rows:
         return feats
 
-    # Prefer Pinnacle; fall back to average of all bookmakers
-    one_x_two = [r for r in odds_rows if r.get("market", "") in ("1X2", "h2h")]
-
-    pinnacle = next(
-        (r for r in one_x_two if "pinnacle" in (r.get("bookmaker", "") or "").lower()),
-        None,
-    )
-    row = pinnacle or (one_x_two[0] if one_x_two else None)
-    if not row:
+    one_x_two = [r for r in odds_rows if (r.get("market") or "") == "1X2"]
+    if not one_x_two:
         return feats
 
-    # Closing implied probabilities (overround-removed)
-    close_h = row.get("closing_home") or row.get("opening_home")
-    close_d = row.get("closing_draw") or row.get("opening_draw")
-    close_a = row.get("closing_away") or row.get("opening_away")
+    # Prefer Pinnacle; fall back to any bookmaker
+    pinnacle_rows = [r for r in one_x_two if "pinnacle" in (r.get("bookmaker", "") or "").lower()]
+    rows = pinnacle_rows or one_x_two
+    rows_sorted = sorted(rows, key=lambda r: r.get("pulled_at") or "")
+    latest = rows_sorted[-1]
+    earliest = rows_sorted[0]
+
+    close_h = latest.get("home_odds")
+    close_d = latest.get("draw_odds")
+    close_a = latest.get("away_odds")
 
     if close_h and close_a:
-        implied_h = _safe_div(1.0, close_h)
-        implied_d = _safe_div(1.0, close_d) if close_d else 0.0
-        implied_a = _safe_div(1.0, close_a)
+        implied_h = _safe_div(1.0, float(close_h))
+        implied_d = _safe_div(1.0, float(close_d)) if close_d else 0.0
+        implied_a = _safe_div(1.0, float(close_a))
         overround = implied_h + implied_d + implied_a
 
         feats["market_overround"]    = round(overround, 4)
@@ -482,19 +496,19 @@ def compute_market_features(odds_rows: list[dict]) -> dict[str, float]:
         feats["market_implied_draw"] = round(_safe_div(implied_d, overround), 4)
         feats["market_implied_away"] = round(_safe_div(implied_a, overround), 4)
 
-        if pinnacle:
+        if pinnacle_rows:
             feats["pinnacle_home_close"] = float(close_h)
             feats["pinnacle_away_close"] = float(close_a)
 
-    # Odds movement: closing vs opening (positive = odds shortened = more money in)
-    open_h = row.get("opening_home")
-    open_a = row.get("opening_away")
+    # Odds movement: earliest pull vs latest pull (proxy for open/close since
+    # fixture_odds has no explicit opening/closing columns, only pulled_at)
+    open_h = earliest.get("home_odds")
+    open_a = earliest.get("away_odds")
     if open_h and close_h:
         feats["odds_move_home"] = round(float(open_h) - float(close_h), 4)
     if open_a and close_a:
         feats["odds_move_away"] = round(float(open_a) - float(close_a), 4)
 
-    # Market confidence: normalised absolute movement (0=no move, 1=large move)
     total_move = abs(feats["odds_move_home"]) + abs(feats["odds_move_away"])
     feats["market_confidence"] = round(min(1.0, total_move / 1.0), 4)
 
@@ -506,6 +520,11 @@ def compute_market_features(odds_rows: list[dict]) -> dict[str, float]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def compute_referee_features(referee: dict | None) -> dict[str, float]:
+    """
+    No referee-stats table exists in the live schema yet (fixtures.referee is
+    a bare name string). Always returns zeroed features until such a table
+    is added and populated — do not fabricate values from the name alone.
+    """
     if not referee:
         return {
             "ref_avg_yellows":    NAN_FILL,
@@ -530,51 +549,179 @@ class FeatureEngineer:
     Builds the complete pre-match feature vector for one or many matches.
 
     All DB queries are carefully scoped to be before match_date — no leakage.
+    Matches are identified by the live schema's composite key (sport, fixture_id).
     """
 
-    def __init__(self, supabase_client):
+    def __init__(self, supabase_client, data_dir: "Path | None" = None):
+        """
+        Parameters
+        ----------
+        supabase_client : live Supabase client.
+                           - data_dir=None: fully online, every loader hits
+                             Supabase directly (the original live-serving path).
+                           - data_dir set + supabase_client=None: fully offline,
+                             for bulk training (scripts/build_feature_cache.py).
+                           - data_dir set + supabase_client given: HYBRID —
+                             snapshot is the fast local base, plus one small
+                             top-up query for match_results/fixtures newer
+                             than the snapshot's newest row. This is what
+                             predictor.py now uses: the online path used to
+                             paginate the ENTIRE match_results table (~298
+                             sequential API calls) before building even one
+                             feature vector — confirmed live, several minutes
+                             per cold FeatureEngineer instance.
+        data_dir : optional path to a local Parquet snapshot directory
+                   (see scripts/export_snapshot.py).
+        """
         self.client = supabase_client
-        self._match_cache:    dict[tuple, pd.DataFrame] = {}
-        self._dc_cache:       dict[int, DixonColesEstimator] = {}
+        self._match_cache:    dict[str, pd.DataFrame] = {}
+        self._dc_cache:       dict[tuple, DixonColesEstimator] = {}
         self._table_cache:    dict[tuple, dict] = {}
+        self._elo_cache:      dict[tuple, dict[int, float]] = {}
+
+        self._offline = data_dir is not None
+        self._local: dict[str, pd.DataFrame] = {}
+        if self._offline:
+            self._load_snapshot(data_dir)
+            if self.client is not None:
+                self._top_up_from_live()
+
+    def _load_snapshot(self, data_dir: "Path") -> None:
+        from pathlib import Path as _Path
+        data_dir = _Path(data_dir)
+        for name in ("fixtures", "match_results", "fixture_odds", "team_form_cache"):
+            matches = sorted(data_dir.glob(f"{name}_*.parquet"))
+            if not matches:
+                self._local[name] = pd.DataFrame()
+                continue
+            self._local[name] = pd.concat(
+                [pd.read_parquet(p) for p in matches], ignore_index=True
+            )
+
+        self._reindex_local()
+
+        logger.info(
+            "[FeatureEngineer] Loaded offline snapshot from %s: %s",
+            data_dir, {k: len(v) for k, v in self._local.items()},
+        )
+
+    def _reindex_local(self) -> None:
+        # Index fixtures and fixture_odds by (sport, fixture_id) via
+        # set_index — O(1)-ish sorted lookup per call instead of a full
+        # boolean scan (up to ~300k rows). Deliberately NOT eagerly
+        # materializing every row as a Python dict up front (.to_dict()
+        # over 300k rows is itself a multi-minute cost and wasteful when
+        # a training run only touches a fraction of the snapshot) — rows
+        # are converted to dicts lazily, only for fixtures actually requested.
+        fx = self._local["fixtures"]
+        self._fixtures_indexed = (
+            fx.set_index(["sport", "fixture_id"]).sort_index() if not fx.empty else fx
+        )
+        fo = self._local["fixture_odds"]
+        self._odds_indexed = (
+            fo.set_index(["sport", "fixture_id"]).sort_index() if not fo.empty else fo
+        )
+
+    def _top_up_from_live(self) -> None:
+        """
+        Hybrid mode only: pull match_results (+ their fixtures) newer than
+        whatever's already in the snapshot, so a periodically-rebuilt local
+        Parquet file doesn't silently go stale for live predictions — without
+        re-paginating the whole historical table every time. One bounded
+        query per sport present in the snapshot, not the full-table scan
+        _load_all_sport_matches() used to do online.
+        """
+        mr = self._local.get("match_results", pd.DataFrame())
+        fx = self._local.get("fixtures", pd.DataFrame())
+        if fx.empty:
+            return
+
+        for sport in fx["sport"].unique():
+            sport_fx = fx[fx["sport"] == sport]
+            cutoff = pd.to_datetime(sport_fx["match_date"], errors="coerce").max()
+            cutoff_iso = (cutoff.isoformat() if pd.notna(cutoff) else "1970-01-01T00:00:00")
+
+            try:
+                res = (
+                    self.client.table("match_results")
+                    .select(
+                        "fixture_id, home_goals, away_goals, total_corners, home_corners,"
+                        " away_corners, total_cards,"
+                        " fixtures!inner(sport, fixture_id, home_team_id, away_team_id, match_date,"
+                        " kickoff_time, league_key, venue, season, round)"
+                    )
+                    .eq("sport", sport)
+                    .not_.is_("home_goals", "null")
+                    .gt("fixtures.match_date", cutoff_iso)
+                    .execute()
+                )
+            except Exception as exc:
+                logger.warning("[FeatureEngineer] top-up query failed for %s (continuing on snapshot only): %s", sport, exc)
+                continue
+
+            rows = res.data or []
+            if not rows:
+                continue
+
+            new_fx_rows, new_mr_rows = [], []
+            for r in rows:
+                fx_data = dict(r.pop("fixtures", {}) or {})
+                fx_data.setdefault("sport", sport)
+                new_fx_rows.append(fx_data)
+                r["sport"] = sport
+                new_mr_rows.append(r)
+
+            if new_fx_rows:
+                self._local["fixtures"] = pd.concat(
+                    [self._local["fixtures"], pd.DataFrame(new_fx_rows)], ignore_index=True
+                )
+            if new_mr_rows:
+                self._local["match_results"] = pd.concat(
+                    [self._local["match_results"], pd.DataFrame(new_mr_rows)], ignore_index=True
+                )
+            logger.info("[FeatureEngineer] Topped up %d %s match(es) newer than snapshot (cutoff=%s)",
+                        len(new_mr_rows), sport, cutoff_iso)
+
+        self._reindex_local()
 
     # ── Public API ──────────────────────────────────────────────
 
-    def build(self, match_id: int) -> dict[str, float]:
+    def build(self, sport: str, fixture_id: str) -> dict[str, float]:
         """Build the full feature dict for a single match."""
-        match = self._load_match(match_id)
+        match = self._load_match(sport, fixture_id)
         if not match:
-            raise ValueError(f"Match {match_id} not found")
+            raise ValueError(f"Fixture {sport}/{fixture_id} not found")
         return self._build_features(match)
 
-    def build_batch(self, match_ids: list[int]) -> pd.DataFrame:
-        """Build feature DataFrame for multiple matches."""
+    def build_batch(self, fixtures: list[tuple[str, str]]) -> pd.DataFrame:
+        """Build feature DataFrame for multiple (sport, fixture_id) matches."""
         rows = []
-        for mid in match_ids:
+        for sport, fixture_id in fixtures:
             try:
-                match = self._load_match(mid)
+                match = self._load_match(sport, fixture_id)
                 if match:
                     feats = self._build_features(match)
-                    feats["match_id"] = mid
+                    feats["sport"] = sport
+                    feats["fixture_id"] = fixture_id
                     rows.append(feats)
             except Exception as exc:
-                logger.warning("Feature build failed for match %d: %s", mid, exc)
+                logger.warning("Feature build failed for %s/%s: %s", sport, fixture_id, exc)
         return pd.DataFrame(rows)
 
     # ── Core feature build ──────────────────────────────────────
 
     def _build_features(self, match: dict) -> dict[str, float]:
-        match_id  = match["id"]
-        home_id   = match["home_team_id"]
-        away_id   = match["away_team_id"]
-        sport     = match["sport"]
-        league_id = match["league_id"]
-        venue     = match.get("venue")
-        referee   = match.get("referee_data")
-        match_dt  = self._parse_dt(match.get("match_date", ""))
+        sport      = match["sport"]
+        fixture_id = match["fixture_id"]
+        home_id    = match["home_team_id"]
+        away_id    = match["away_team_id"]
+        league_key = match.get("league_key")
+        venue      = match.get("venue")
+        referee    = match.get("referee_data")
+        match_dt   = self._parse_dt(match)
 
         if match_dt is None:
-            raise ValueError(f"Cannot parse match_date for match {match_id}")
+            raise ValueError(f"Cannot parse match_date for fixture {sport}/{fixture_id}")
 
         all_matches = self._load_all_sport_matches(sport)
 
@@ -597,9 +744,9 @@ class FeatureEngineer:
         feats["away_win_streak"]   = float(away_form_calc.consecutive_streak(match_dt, "W"))
         feats["away_loss_streak"]  = float(away_form_calc.consecutive_streak(match_dt, "L"))
 
-        # 2. STRENGTH — Elo
-        home_elo = get_elo_at_date(self.client, home_id, match_dt)
-        away_elo = get_elo_at_date(self.client, away_id, match_dt)
+        # 2. STRENGTH — Elo (from team_form_cache; STARTING_ELO if no row cached yet)
+        home_elo = self._get_cached_elo(sport, home_id, match_dt)
+        away_elo = self._get_cached_elo(sport, away_id, match_dt)
         feats["elo_home"]        = round(home_elo, 2)
         feats["elo_away"]        = round(away_elo, 2)
         feats["elo_diff"]        = round(home_elo - away_elo, 2)
@@ -608,7 +755,7 @@ class FeatureEngineer:
         )
 
         # Dixon-Coles
-        dc = self._get_dixon_coles(league_id, all_matches, match_dt)
+        dc = self._get_dixon_coles(league_key, all_matches, match_dt)
         feats["dc_attack_home"]  = round(dc.attack(home_id),    4)
         feats["dc_defense_home"] = round(dc.defense(home_id),   4)
         feats["dc_attack_away"]  = round(dc.attack(away_id),    4)
@@ -621,14 +768,14 @@ class FeatureEngineer:
         feats.update(compute_h2h_features(home_id, away_id, venue, match_dt, all_matches))
 
         # 4. CONTEXT
-        league_table = self._build_league_table(league_id, all_matches, match_dt)
+        league_table = self._build_league_table(league_key, all_matches, match_dt)
         feats.update(compute_context_features(match, home_id, home_hist_df, match_dt,
                                               league_table, is_home=True))
         feats.update(compute_context_features(match, away_id, away_hist_df, match_dt,
                                               league_table, is_home=False))
 
         # 5. MARKET
-        odds_rows = self._load_odds(match_id)
+        odds_rows = self._load_odds(sport, fixture_id)
         feats.update(compute_market_features(odds_rows))
 
         # 6. REFEREE
@@ -642,80 +789,130 @@ class FeatureEngineer:
 
     # ── DB Loaders ──────────────────────────────────────────────
 
-    def _load_match(self, match_id: int) -> dict | None:
+    def _load_match(self, sport: str, fixture_id: str) -> dict | None:
+        if self._offline:
+            try:
+                row = self._fixtures_indexed.loc[(sport, fixture_id)]
+                m = row.to_dict()
+                m["sport"], m["fixture_id"] = sport, fixture_id
+                m["referee_data"] = None
+                return m
+            except KeyError:
+                # Hybrid mode only: the fixture being predicted right now is
+                # inherently newer than any periodically-rebuilt snapshot —
+                # a single-row live lookup here is cheap (unlike the full
+                # historical top-up), so fall through rather than fail.
+                if self.client is None:
+                    return None
+
         res = (
-            self.client.table("matches")
-            .select("*, leagues(name), sports(slug), referees(*)")
-            .eq("id", match_id)
+            self.client.table("fixtures")
+            .select("*")
+            .eq("sport", sport)
+            .eq("fixture_id", fixture_id)
             .single()
             .execute()
         )
         if not res.data:
             return None
         m = res.data
-        m["referee_data"] = m.pop("referees", None)
+        # No referee-stats table in the live schema yet — see compute_referee_features
+        m["referee_data"] = None
         return m
 
     def _load_all_sport_matches(self, sport: str) -> pd.DataFrame:
-        """Load all finished matches for the sport (cached per sport)."""
-        key = ("sport", sport)
-        if key in self._match_cache:
-            return self._match_cache[key]
+        """
+        Load all finished matches for the sport (match_results joined with
+        fixtures for team ids / date / league), cached per sport.
+        """
+        if sport in self._match_cache:
+            return self._match_cache[sport]
 
-        all_rows: list[dict] = []
-        page, psize = 0, 10_000
-        while True:
-            res = (
-                self.client.table("matches")
-                .select("id, home_team_id, away_team_id, home_score, away_score,"
-                        " match_date, league_id, venue, season, round")
-                .eq("sport", sport)
-                .eq("status", "finished")
-                .not_.is_("home_score", "null")
-                .order("match_date", desc=False)
-                .range(page * psize, (page + 1) * psize - 1)
-                .execute()
-            )
-            batch = res.data or []
-            all_rows.extend(batch)
-            if len(batch) < psize:
-                break
-            page += 1
+        if self._offline:
+            mr = self._local["match_results"]
+            fx = self._local["fixtures"]
+            mr = mr[(mr["sport"] == sport) & mr["home_goals"].notna()]
+            fx_cols = ["sport", "fixture_id", "home_team_id", "away_team_id",
+                       "match_date", "kickoff_time", "league_key", "venue", "season", "round"]
+            df = mr.merge(fx[fx_cols], on=["sport", "fixture_id"], how="inner")
+        else:
+            all_rows: list[dict] = []
+            page, psize = 0, 1_000
+            while True:
+                res = (
+                    self.client.table("match_results")
+                    .select(
+                        "fixture_id, home_goals, away_goals, total_corners, home_corners,"
+                        " away_corners, total_cards,"
+                        " fixtures!inner(home_team_id, away_team_id, match_date, kickoff_time,"
+                        " league_key, venue, season, round)"
+                    )
+                    .eq("sport", sport)
+                    .not_.is_("home_goals", "null")
+                    .range(page * psize, (page + 1) * psize - 1)
+                    .execute()
+                )
+                batch = res.data or []
+                for r in batch:
+                    fx = r.pop("fixtures", {}) or {}
+                    r.update(fx)
+                all_rows.extend(batch)
+                if len(batch) < psize:
+                    break
+                page += 1
+            df = pd.DataFrame(all_rows)
 
-        df = pd.DataFrame(all_rows)
         if not df.empty:
-            df["match_date"] = pd.to_datetime(df["match_date"], utc=True, errors="coerce")
+            df["match_date"] = pd.to_datetime(df["match_date"], errors="coerce")
             df["match_date"] = df["match_date"].dt.tz_localize(None)
-        self._match_cache[key] = df
+            df = df.sort_values("match_date").reset_index(drop=True)
+        self._match_cache[sport] = df
         return df
 
     def _team_history(self, team_id: int, all_matches: pd.DataFrame,
                       before_dt: datetime, is_home: bool) -> pd.DataFrame:
         """
         Filter all_matches for team_id, add perspective columns (is_home,
-        goals_for, goals_against, result, clean_sheet, btts, over25).
+        goals_for, goals_against, corners_for, corners_against, cards_total,
+        result, clean_sheet, btts, over25).
         """
-        home_games = all_matches[all_matches["home_team_id"] == team_id].copy()
-        away_games = all_matches[all_matches["away_team_id"] == team_id].copy()
+        if all_matches.empty:
+            return all_matches
+
+        # Slice to only the columns this function needs before filtering —
+        # the full frame carries ~35 mostly-unused object-dtype columns
+        # (raw_stats, scoreline, ftr, ...) whose presence forces the later
+        # row-wise result computation onto pandas' slow generic object path.
+        needed = ["match_date", "home_team_id", "away_team_id",
+                  "home_goals", "away_goals", "home_corners", "away_corners", "total_cards"]
+        slim = all_matches[needed]
+
+        home_games = slim[slim["home_team_id"] == team_id].copy()
+        away_games = slim[slim["away_team_id"] == team_id].copy()
 
         def _enrich(df: pd.DataFrame, perspective_home: bool) -> pd.DataFrame:
             df = df.copy()
             df["is_home"] = perspective_home
             if perspective_home:
-                df["goals_for"]     = df["home_score"]
-                df["goals_against"] = df["away_score"]
+                df["goals_for"]      = df["home_goals"]
+                df["goals_against"]  = df["away_goals"]
+                df["corners_for"]    = df.get("home_corners", pd.Series(NAN_FILL, index=df.index))
+                df["corners_against"]= df.get("away_corners", pd.Series(NAN_FILL, index=df.index))
             else:
-                df["goals_for"]     = df["away_score"]
-                df["goals_against"] = df["home_score"]
-            df["result"] = df.apply(lambda r:
-                "W" if r["goals_for"] > r["goals_against"] else
-                ("D" if r["goals_for"] == r["goals_against"] else "L"), axis=1)
+                df["goals_for"]      = df["away_goals"]
+                df["goals_against"]  = df["home_goals"]
+                df["corners_for"]    = df.get("away_corners", pd.Series(NAN_FILL, index=df.index))
+                df["corners_against"]= df.get("home_corners", pd.Series(NAN_FILL, index=df.index))
+            df["cards_total"] = df.get("total_cards", pd.Series(NAN_FILL, index=df.index))
+            # Vectorized W/D/L — was a per-row .apply(axis=1), the dominant
+            # cost in feature building at scale.
+            df["result"] = np.where(
+                df["goals_for"] > df["goals_against"], "W",
+                np.where(df["goals_for"] == df["goals_against"], "D", "L"),
+            )
             df["clean_sheet"] = (df["goals_against"] == 0).astype(int)
             df["btts"]        = ((df["goals_for"] > 0) & (df["goals_against"] > 0)).astype(int)
             df["over25"]      = ((df["goals_for"] + df["goals_against"]) > 2.5).astype(int)
-            # xG placeholders — leave 0; real xG could come from match_stats
-            df["xg_for"] = NAN_FILL
-            df["xga"]    = NAN_FILL
             return df
 
         combined = pd.concat([
@@ -725,61 +922,136 @@ class FeatureEngineer:
 
         return combined[combined["match_date"] < pd.Timestamp(before_dt)]
 
-    def _load_odds(self, match_id: int) -> list[dict]:
+    def _load_odds(self, sport: str, fixture_id: str) -> list[dict]:
+        if self._offline:
+            try:
+                hit = self._odds_indexed.loc[[(sport, fixture_id)]]
+            except KeyError:
+                return []
+            return hit.reset_index().to_dict(orient="records")
+
         res = (
-            self.client.table("odds_history")
+            self.client.table("fixture_odds")
             .select("*")
-            .eq("match_id", match_id)
+            .eq("sport", sport)
+            .eq("fixture_id", fixture_id)
             .execute()
         )
         return res.data or []
 
-    def _get_dixon_coles(self, league_id: int, all_matches: pd.DataFrame,
+    def _get_cached_elo(self, sport: str, team_id: int, before_dt: datetime) -> float:
+        """
+        Point-in-time Elo lookup from team_form_cache (pre-aggregated,
+        strictly-prior rows only). Falls back to STARTING_ELO when the
+        cache has no row for this team yet.
+        """
+        key = (sport, before_dt.date())
+        if key not in self._elo_cache:
+            self._elo_cache[key] = {}
+        cache = self._elo_cache[key]
+        if team_id in cache:
+            return cache[team_id]
+
+        if self._offline:
+            tf = self._local["team_form_cache"]
+            rating = STARTING_ELO
+            if tf.empty or "sport" not in tf.columns:
+                cache[team_id] = rating
+                return rating
+            hit = tf[
+                (tf["sport"] == sport) & (tf["team_id"] == team_id)
+                & (pd.to_datetime(tf["as_of_date"]) <= pd.Timestamp(before_dt.date()))
+            ]
+            if not hit.empty:
+                latest = hit.sort_values("as_of_date").iloc[-1]
+                if pd.notna(latest.get("elo_rating")):
+                    rating = float(latest["elo_rating"])
+            cache[team_id] = rating
+            return rating
+
+        res = (
+            self.client.table("team_form_cache")
+            .select("elo_rating")
+            .eq("sport", sport)
+            .eq("team_id", team_id)
+            .lte("as_of_date", before_dt.date().isoformat())
+            .order("as_of_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rating = STARTING_ELO
+        if res.data and res.data[0].get("elo_rating") is not None:
+            rating = float(res.data[0]["elo_rating"])
+        cache[team_id] = rating
+        return rating
+
+    def _get_dixon_coles(self, league_key: str | None, all_matches: pd.DataFrame,
                           before_dt: datetime) -> DixonColesEstimator:
-        key = (league_id, before_dt.date())
+        key = (league_key, before_dt.date())
         if key in self._dc_cache:
             return self._dc_cache[key]
-        league_matches = all_matches[all_matches["league_id"] == league_id]
+        league_matches = (
+            all_matches[all_matches["league_key"] == league_key]
+            if league_key is not None and not all_matches.empty
+            else all_matches
+        )
         dc = DixonColesEstimator(league_matches).fit(before_dt)
         self._dc_cache[key] = dc
         return dc
 
-    def _build_league_table(self, league_id: int, all_matches: pd.DataFrame,
+    def _build_league_table(self, league_key: str | None, all_matches: pd.DataFrame,
                              before_dt: datetime) -> dict[int, dict]:
         """
         Simulate standing at before_dt.
         Returns {team_id: {position, points, top4_gap, relegation_gap}}.
         """
-        key = (league_id, before_dt.date())
+        key = (league_key, before_dt.date())
         if key in self._table_cache:
             return self._table_cache[key]
 
+        if all_matches.empty:
+            self._table_cache[key] = {}
+            return {}
+
         hist = all_matches[
-            (all_matches["league_id"] == league_id) &
+            (all_matches["league_key"] == league_key) &
             (all_matches["match_date"] < pd.Timestamp(before_dt))
         ]
-        table: dict[int, dict] = {}
-        for _, r in hist.iterrows():
-            for tid, gf, ga in [(r["home_team_id"], r["home_score"], r["away_score"]),
-                                (r["away_team_id"], r["away_score"], r["home_score"])]:
-                if tid not in table:
-                    table[tid] = {"points": 0, "gd": 0, "played": 0}
-                if gf > ga:   table[tid]["points"] += 3
-                elif gf == ga: table[tid]["points"] += 1
-                table[tid]["gd"] += (gf - ga)
-                table[tid]["played"] += 1
+        if hist.empty:
+            self._table_cache[key] = {}
+            return {}
 
-        sorted_teams = sorted(table.items(), key=lambda x: (-x[1]["points"], -x[1]["gd"]))
-        n = len(sorted_teams)
+        # Vectorized standings — was a Python-level iterrows() over full
+        # league history per fixture-date (the dominant cost in feature
+        # building at scale); now a single groupby over ≤2×len(hist) rows,
+        # bounded by team count (~20-24) afterward, not history length.
+        home = hist[["home_team_id", "home_goals", "away_goals"]].rename(
+            columns={"home_team_id": "team_id", "home_goals": "gf", "away_goals": "ga"})
+        away = hist[["away_team_id", "away_goals", "home_goals"]].rename(
+            columns={"away_team_id": "team_id", "away_goals": "gf", "home_goals": "ga"})
+        long = pd.concat([home, away], ignore_index=True)
+        long["points"] = np.where(long["gf"] > long["ga"], 3, np.where(long["gf"] == long["ga"], 1, 0))
+        long["gd"] = long["gf"] - long["ga"]
+
+        agg = (
+            long.groupby("team_id")
+            .agg(points=("points", "sum"), gd=("gd", "sum"))
+            .sort_values(["points", "gd"], ascending=[False, False])
+        )
+
+        n = len(agg)
+        pts_arr = agg["points"].values
+        top4_pts = int(pts_arr[min(3, n - 1)]) if n >= 4 else 0
+        rel_pts  = int(pts_arr[max(n - 4, 0)]) if n >= 4 else 0
+
         result: dict[int, dict] = {}
-        for pos, (tid, stats) in enumerate(sorted_teams, start=1):
-            top4_pts   = sorted_teams[min(3, n-1)][1]["points"] if n >= 4 else 0
-            rel_pts    = sorted_teams[max(n-4, 0)][1]["points"] if n >= 4 else 0
+        for pos, (tid, row) in enumerate(agg.iterrows(), start=1):
+            points = int(row["points"])
             result[tid] = {
                 "position":       pos,
-                "points":         stats["points"],
-                "top4_gap":       max(0, top4_pts - stats["points"]),
-                "relegation_gap": max(0, stats["points"] - rel_pts),
+                "points":         points,
+                "top4_gap":       max(0, top4_pts - points),
+                "relegation_gap": max(0, points - rel_pts),
             }
 
         self._table_cache[key] = result
@@ -788,23 +1060,37 @@ class FeatureEngineer:
     # ── Utility ─────────────────────────────────────────────────
 
     @staticmethod
-    def _parse_dt(value: str) -> datetime | None:
-        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+    def _parse_dt(match: dict) -> datetime | None:
+        """
+        fixtures.match_date is a bare date; kickoff_time is a separate time
+        column. Combine them (default midnight if kickoff_time is null).
+        """
+        raw_date = match.get("match_date")
+        if not raw_date:
+            return None
+        try:
+            d = datetime.strptime(str(raw_date)[:10], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return None
+        raw_time = match.get("kickoff_time")
+        t = time(0, 0, 0)
+        if raw_time:
             try:
-                raw = datetime.strptime(value[:19], fmt[:len(fmt)])
-                return raw.replace(tzinfo=None)
+                t = datetime.strptime(str(raw_time)[:8], "%H:%M:%S").time()
             except (ValueError, TypeError):
-                continue
-        return None
+                pass
+        return datetime.combine(d, t)
 
     def feature_names(self) -> list[str]:
         """Build a dummy feature vector to enumerate all feature names."""
         dummy_feats = {
             **{f"home_form{w}_{s}": 0.0 for w in FORM_WINDOWS
-               for s in ["ppg","gscored","gconceded","xg","xga","cs_rate","btts_rate",
-                         "over25_rate","win_pct","draw_pct","loss_pct"]},
+               for s in ["ppg","gscored","gconceded","corners_for","corners_against",
+                         "cards_total","cs_rate","btts_rate","over25_rate",
+                         "win_pct","draw_pct","loss_pct"]},
             **{f"away_form{w}_{s}": 0.0 for w in FORM_WINDOWS
-               for s in ["ppg","gscored","gconceded","xg","xga","cs_rate","btts_rate",
-                         "over25_rate","win_pct","draw_pct","loss_pct"]},
+               for s in ["ppg","gscored","gconceded","corners_for","corners_against",
+                         "cards_total","cs_rate","btts_rate","over25_rate",
+                         "win_pct","draw_pct","loss_pct"]},
         }
         return sorted(dummy_feats.keys())

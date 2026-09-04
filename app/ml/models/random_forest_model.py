@@ -23,7 +23,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import log_loss
 
-from app.base_model import (
+from app.ml.models.base_model import (
     BetHeroBaseModel,
     CalibrationMethod,
     PredictionBatch,
@@ -128,8 +128,11 @@ class RandomForestBetModel(BetHeroBaseModel):
     ) -> None:
         if not self._fitted:
             raise RuntimeError("Call train() before calibrate()")
+        from sklearn.frozen import FrozenEstimator
         sk_method = "isotonic" if method == CalibrationMethod.ISOTONIC else "sigmoid"
-        self._cal = CalibratedClassifierCV(self._rf, method=sk_method, cv="prefit")
+        # sklearn >=1.6 removed cv="prefit" in favor of wrapping the already-fitted
+        # estimator in FrozenEstimator.
+        self._cal = CalibratedClassifierCV(FrozenEstimator(self._rf), method=sk_method)
         self._cal.fit(self._align_features(X_cal), y_cal)
         self._calibrated = True
         logger.info("[RF] Calibrated (%s) on %d samples", sk_method, len(X_cal))
@@ -163,7 +166,7 @@ class RandomForestBetModel(BetHeroBaseModel):
              "classes": self._classes, "feature_names": self._feature_names},
             tmp,
         )
-        tmp.rename(path)
+        tmp.replace(path)  # atomic overwrite (Path.rename fails on Windows if dest exists)
         self._write_metadata_sidecar(path)
         logger.info("[RF] Saved → %s", path)
         return path

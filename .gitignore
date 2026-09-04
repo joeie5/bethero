@@ -14,3 +14,14 @@ env/
 /data/
 /stats/
 /temp/
+
+# Regenerable data artifacts — large, reproducible via scripts/export_snapshot.py
+# and scripts/build_feature_cache.py, or already synced live to the VPS.
+/data_snapshot/
+/backtest_web/data/
+/backtest_web/results_cache/
+/backtest_web/__pycache__/
+/backtest_web/*.log
+/vps_backtest_local/data/
+/vps_backtest_local/results_cache/
+/vps_backtest_local/__pycache__/

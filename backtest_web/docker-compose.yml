@@ -1,0 +1,11 @@
+services:
+  bethero-backtest:
+    build: .
+    container_name: bethero-backtest
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8005:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data

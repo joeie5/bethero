@@ -24,7 +24,7 @@ from sklearn.metrics import log_loss
 from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
-from app.base_model import (
+from app.ml.models.base_model import (
     BetHeroBaseModel,
     CalibrationMethod,
     PredictionBatch,
@@ -196,7 +196,7 @@ class XGBoostBetModel(BetHeroBaseModel):
              "classes": self._classes, "feature_names": self._feature_names},
             tmp,
         )
-        tmp.rename(path)
+        tmp.replace(path)  # atomic overwrite (Path.rename fails on Windows if dest exists)
         self._write_metadata_sidecar(path)
         logger.info("[XGB] Saved → %s", path)
         return path

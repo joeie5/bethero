@@ -13,7 +13,7 @@ Level-1 (base models, already trained separately):
 
 Level-2 (meta-learner):
     XGBClassifier trained on stacked probabilities
-    → calibrated with IsotonicRegression per class
+    → calibrated with sigmoid (Platt) scaling per class
     → final output: DataFrame(n_samples, n_classes) of calibrated probabilities
 
 Key design decisions
@@ -25,7 +25,7 @@ Key design decisions
   base models are NOT re-trained here; their existing .predict_proba()
   on a held-out set provides the stacked features.
 - Meta-learner Optuna tuning (20 trials, fast since input is small).
-- IsotonicRegression calibration on a second held-out slice.
+- Sigmoid (Platt) calibration on a second held-out slice.
 - Full BetHeroBaseModel compliance for save/load/backtest.
 - Thread-safe predict_proba via inherited RLock.
 
@@ -55,22 +55,22 @@ import joblib
 import numpy as np
 import pandas as pd
 import optuna
-from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.preprocessing import LabelEncoder, label_binarize
 from xgboost import XGBClassifier
 
-from app.base_model import (
+from app.ml.models.base_model import (
     BetHeroBaseModel,
     CalibrationMethod,
     PredictionBatch,
     TrainingResult,
 )
-from app.lstm_model import LSTMBetModel
-from app.lightgbm_model import LightGBMBetModel
-from app.neural_network_model import NeuralNetworkBetModel
-from app.random_forest_model import RandomForestBetModel
-from app.xgboost_model import XGBoostBetModel
+from app.ml.models.lstm_model import LSTMBetModel
+from app.ml.models.lightgbm_model import LightGBMBetModel
+from app.ml.models.neural_network_model import NeuralNetworkBetModel
+from app.ml.models.random_forest_model import RandomForestBetModel
+from app.ml.models.xgboost_model import XGBoostBetModel
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -203,7 +203,7 @@ class StackingEnsemble(BetHeroBaseModel):
     Level-2 stacking ensemble.
 
     Trains an XGBoost meta-learner on stacked probability outputs from
-    base models (RF, XGB, LGB, NN, LSTM). Calibrated with IsotonicRegression.
+    base models (RF, XGB, LGB, NN, LSTM). Calibrated with sigmoid (Platt) scaling.
     Per-sport weights bias the stacked input toward stronger base models.
     """
 
@@ -227,7 +227,7 @@ class StackingEnsemble(BetHeroBaseModel):
         # Meta-learner
         self._meta:         XGBClassifier | None         = None
         self._le:           LabelEncoder                 = LabelEncoder()
-        self._cals:         list[IsotonicRegression]     = []
+        self._cals:         list[LogisticRegression]     = []
 
         # Weighting
         self._weight_reg:   SportWeightRegistry          = SportWeightRegistry()
@@ -476,16 +476,27 @@ class StackingEnsemble(BetHeroBaseModel):
         logger.info("[Ensemble/%s/%s]\n%s", self.sport, self.market, result.summary())
         return result
 
-    # ── calibrate (Isotonic per class) ────────────────────────────────────
+    # ── calibrate (Platt / sigmoid per class, per §1.2) ────────────────────
 
     def calibrate(
         self,
         X_cal: pd.DataFrame,
         y_cal: pd.Series,
-        method: str = CalibrationMethod.ISOTONIC,
+        method: str = CalibrationMethod.PLATT,
     ) -> None:
+        """
+        Fit sigmoid (Platt) calibration per class on a held-out slice.
+
+        X_cal/y_cal must never overlap with train() or the meta-learner's
+        own validation split — this is the held-out ~15% required by §1.2.
+        """
         if not self._fitted:
             raise RuntimeError("Call train() first")
+        if method != CalibrationMethod.PLATT:
+            raise ValueError(
+                f"Only Platt/sigmoid calibration ({CalibrationMethod.PLATT!r}) "
+                f"is supported per project policy — got {method!r}"
+            )
         Z_cal  = self._build_stack(X_cal)
         raw    = self._meta.predict_proba(Z_cal)
         n_cls  = len(self._classes)
@@ -494,18 +505,61 @@ class StackingEnsemble(BetHeroBaseModel):
         y_ohe  = np.eye(n_cls)[y_enc]
         self._cals = []
         for i in range(n_cls):
-            iso = IsotonicRegression(out_of_bounds="clip")
-            iso.fit(raw[:, i], y_ohe[:, i])
-            self._cals.append(iso)
+            platt = LogisticRegression(C=1e5, solver="lbfgs")
+            platt.fit(raw[:, i].reshape(-1, 1), y_ohe[:, i])
+            self._cals.append(platt)
         self._calibrated = True
-        logger.info("[Ensemble] Calibrated on %d samples", len(X_cal))
+        logger.info("[Ensemble] Platt-calibrated on %d samples", len(X_cal))
 
     def _apply_cal(self, p: np.ndarray) -> np.ndarray:
         if not self._calibrated or not self._cals:
             return p
-        cols = np.column_stack([c.predict(p[:, i]) for i, c in enumerate(self._cals)])
+        cols = np.column_stack([
+            c.predict_proba(p[:, i].reshape(-1, 1))[:, 1] for i, c in enumerate(self._cals)
+        ])
         s    = cols.sum(axis=1, keepdims=True)
         return cols / np.where(s == 0, 1.0, s)
+
+    # ── calibration verification table (§1.2 go/no-go check) ───────────────
+
+    def calibration_table(
+        self,
+        X_test: pd.DataFrame,
+        y_test: pd.Series,
+        n_buckets: int = 10,
+        max_bucket_error: float = 0.10,
+    ) -> pd.DataFrame:
+        """
+        Predicted-confidence bucket vs actual hit rate, per §1.2.
+
+        No bucket should be more than ~10 points off; a model whose table
+        fails this must not proceed to ticket-building. Caller decides what
+        to do with a failing table — this only reports it.
+        """
+        batch      = self.predict_proba(X_test)
+        confidence = batch.confidence.values
+        correct    = (batch.predicted_class.values == y_test.values).astype(float)
+
+        bucket_edges = np.linspace(0.0, 1.0, n_buckets + 1)
+        bucket_idx   = np.clip(np.digitize(confidence, bucket_edges) - 1, 0, n_buckets - 1)
+
+        rows = []
+        for b in range(n_buckets):
+            mask = bucket_idx == b
+            n    = int(mask.sum())
+            if n == 0:
+                continue
+            predicted_conf = float(confidence[mask].mean())
+            actual_hit     = float(correct[mask].mean())
+            rows.append({
+                "bucket":          f"{bucket_edges[b]:.1f}-{bucket_edges[b+1]:.1f}",
+                "n":               n,
+                "predicted_conf":  round(predicted_conf, 4),
+                "actual_hit_rate": round(actual_hit, 4),
+                "abs_error":       round(abs(predicted_conf - actual_hit), 4),
+                "within_bound":    abs(predicted_conf - actual_hit) <= max_bucket_error,
+            })
+        return pd.DataFrame(rows)
 
     # ── predict_proba ──────────────────────────────────────────────────────
 
@@ -553,7 +607,7 @@ class StackingEnsemble(BetHeroBaseModel):
             },
             tmp,
         )
-        tmp.rename(path)
+        tmp.replace(path)  # atomic overwrite (Path.rename fails on Windows if dest exists)
         self._write_metadata_sidecar(path, extra={
             "base_models": self._base_names,
             "sport_weights": self._weights,

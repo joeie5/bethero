@@ -1,15 +1,18 @@
 """
-result_fetcher.py — Resolves PENDING predictions against actual match results.
+result_fetcher.py — Resolves unsettled predictions against actual match
+results, feeding the retrain counter.
 
 Responsibilities
 ----------------
-1. Poll Supabase every 2 hours for all PENDING predictions
-   whose match_date is in the past
-2. Fetch actual results from API-Sports
-3. Update predictions.status → CORRECT | INCORRECT
-4. Update accumulator_legs.status and compute accumulator.status
-5. Write actual match stats to match_stats and prediction_results
-6. When 200+ new resolutions accumulate, set a retraining flag in Redis
+1. Poll Supabase every 2 hours for all predictions with is_correct IS NULL
+   whose fixture's match_date is in the past
+2. Fetch actual results from API-Sports if not already in match_results
+3. Upsert the real outcome into match_results (sport, fixture_id) — the
+   live schema, not the abandoned `matches`/`match_stats` tables this file
+   used to target (confirmed gone from the DB: PostgREST returns PGRST205
+   "Perhaps you meant... match_results").
+4. Update predictions.is_correct / actual_outcome / settled_at
+5. When 200+ new resolutions accumulate, set a retraining flag in Redis
 
 APScheduler interval: every 2 hours
 """
@@ -52,19 +55,15 @@ API_SPORTS_SPORT_MAP: dict[str, str] = {
 }
 
 
-# ─────────────────────────── Retry Decorator ───────────────────────────────
-
 def _api_retry(fn):
     return retry(
-        retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError)),
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=2, min=2, max=60),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((httpx.HTTPError,)),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )(fn)
 
-
-# ─────────────────────────── API-Sports Result Client ──────────────────────
 
 class ResultAPIClient:
 
@@ -78,32 +77,16 @@ class ResultAPIClient:
         )
 
     @_api_retry
-    def get_fixture(self, sport_slug: str, external_fixture_id: int) -> dict | None:
+    def get_fixture(self, sport_slug: str, fixture_id: str) -> dict | None:
+        """Look up one fixture by its real API-Sports id — fixture_id in our
+        schema IS the API-Sports id (see fixture_fetcher.map_football_fixture),
+        so this is a direct, precise lookup, not a fuzzy name/date search."""
         sport = API_SPORTS_SPORT_MAP.get(sport_slug, "football")
         base  = f"https://v3.{sport}.api-sports.io"
-        resp  = self._http.get(f"{base}/fixtures", params={"id": external_fixture_id})
+        resp  = self._http.get(f"{base}/fixtures", params={"id": fixture_id})
         resp.raise_for_status()
         items = resp.json().get("response", [])
         return items[0] if items else None
-
-    @_api_retry
-    def search_fixture(self, sport_slug: str, home: str, away: str, date: str) -> dict | None:
-        """Fallback search by team names + date when external_id is unknown."""
-        sport = API_SPORTS_SPORT_MAP.get(sport_slug, "football")
-        base  = f"https://v3.{sport}.api-sports.io"
-        resp  = self._http.get(f"{base}/fixtures", params={
-            "team_name": home,
-            "date":      date[:10],
-            "timezone":  "UTC",
-        })
-        resp.raise_for_status()
-        items = resp.json().get("response", [])
-        for item in items:
-            teams = item.get("teams", {})
-            if (away.lower()[:5] in teams.get("away", {}).get("name", "").lower() or
-                    home.lower()[:5] in teams.get("home", {}).get("name", "").lower()):
-                return item
-        return None
 
     def close(self):
         self._http.close()
@@ -113,52 +96,62 @@ class ResultAPIClient:
 
 class OutcomeResolver:
     """
-    Determines whether a prediction was CORRECT or INCORRECT given match result.
+    Determines whether a prediction was correct given the real match_results
+    row. Matches predictor.py's actual db_market strings exactly — the prior
+    version string-matched against markets ("OVER/UNDER", "1X2") that never
+    matched what predictor.py actually emits (Over_Under_Goals, 1x2, ...),
+    so most markets silently resolved INCORRECT regardless of outcome.
     """
 
     @staticmethod
-    def resolve(market: str, predicted_outcome: str, home_score: int, away_score: int) -> str:
-        """Returns 'CORRECT' or 'INCORRECT'."""
-        market = market.upper()
-        predicted = predicted_outcome.strip().upper()
+    def resolve(db_market: str, selection: str, result: dict) -> bool:
+        """Returns True (correct) / False (incorrect). `result` is a
+        match_results row: home_goals, away_goals, btts, total_corners,
+        total_cards, ftr."""
+        market = (db_market or "").strip()
+        sel    = (selection or "").strip().upper()
+        hg, ag = result.get("home_goals"), result.get("away_goals")
 
         try:
-            if "1X2" in market or "H2H" in market:
-                if home_score > away_score:
-                    actual = "HOME"
-                elif away_score > home_score:
-                    actual = "AWAY"
-                else:
-                    actual = "DRAW"
-                return "CORRECT" if predicted == actual else "INCORRECT"
+            if market == "BTTS":
+                both = bool(hg > 0 and ag > 0)
+                return (sel == "YES") == both
 
-            if "OVER/UNDER" in market or "TOTALS" in market:
-                # e.g. "Over 2.5"
-                parts = predicted.split()
-                direction = parts[0] if parts else ""
-                line = float(parts[1]) if len(parts) > 1 else 2.5
-                total = home_score + away_score
-                if direction == "OVER":
-                    return "CORRECT" if total > line else "INCORRECT"
-                else:
-                    return "CORRECT" if total < line else "INCORRECT"
+            if market == "1X2":
+                ftr = result.get("ftr")
+                actual = {"H": "HOME", "D": "DRAW", "A": "AWAY"}.get(ftr)
+                return sel == actual
 
-            if "BTTS" in market:
-                both = home_score > 0 and away_score > 0
-                return "CORRECT" if (predicted == "YES") == both else "INCORRECT"
+            if market == "Double_Chance":
+                ftr = result.get("ftr")
+                covers = {
+                    "1X": {"H", "D"}, "X2": {"D", "A"}, "12": {"H", "A"},
+                }.get(sel, set())
+                return ftr in covers
 
-            if "HANDICAP" in market or "SPREAD" in market:
-                # e.g. "Home -1.5"
-                parts = predicted.split()
-                side = parts[0] if parts else "HOME"
-                handicap = float(parts[1]) if len(parts) > 1 else 0.0
-                margin = (home_score - away_score) if side.upper() == "HOME" else (away_score - home_score)
-                return "CORRECT" if (margin + handicap) > 0 else "INCORRECT"
+            if market == "Over_Under_Goals":
+                direction, line = sel.split()
+                total = (hg or 0) + (ag or 0)
+                return total > float(line) if direction == "OVER" else total < float(line)
+
+            if market == "Over_Under_Corners":
+                total_corners = result.get("total_corners")
+                if total_corners is None:
+                    return False
+                direction, line = sel.split()
+                return total_corners > float(line) if direction == "OVER" else total_corners < float(line)
+
+            if market == "Cards":
+                total_cards = result.get("total_cards")
+                if total_cards is None:
+                    return False
+                direction, line = sel.split()
+                return total_cards > float(line) if direction == "OVER" else total_cards < float(line)
 
         except Exception as exc:
-            logger.warning("Outcome resolve error (market=%s, pred=%s): %s", market, predicted_outcome, exc)
+            logger.warning("Outcome resolve error (market=%s, sel=%s): %s", market, selection, exc)
 
-        return "INCORRECT"
+        return False
 
 
 # ─────────────────────────── Result Fetcher ────────────────────────────────
@@ -173,13 +166,13 @@ class ResultFetcher:
     def run(self) -> None:
         logger.info("🔍 ResultFetcher starting — %s UTC", datetime.now(timezone.utc).isoformat())
         pending = self._fetch_pending_predictions()
-        logger.info("Found %d PENDING predictions to check", len(pending))
+        logger.info("Found %d unresolved predictions to check", len(pending))
 
         for pred in pending:
             try:
                 self._resolve_prediction(pred)
             except Exception as exc:
-                logger.error("Error resolving prediction %d: %s", pred["id"], exc, exc_info=True)
+                logger.error("Error resolving prediction %s: %s", pred.get("id"), exc, exc_info=True)
 
         if self._new_resolutions > 0:
             self._update_retrain_counter(self._new_resolutions)
@@ -191,183 +184,171 @@ class ResultFetcher:
 
     def _fetch_pending_predictions(self) -> list[dict]:
         """
-        Fetch PENDING predictions whose match finished in the past.
-        JOIN through matches to get scores and team names.
+        Predictions not yet settled (is_correct IS NULL), whose fixture is
+        due to be checked: status='FT' (fixture_fetcher.py sets this once
+        API-Sports reports the match finished) OR match_date is a prior
+        calendar day (catch-all for anything whose status update was
+        missed). fixtures.match_date is a bare `date` column, not a
+        timestamp (kickoff_time is separately `time without time zone`,
+        never combined) — confirmed live: comparing it against a full ISO
+        datetime silently failed to match same-day finished fixtures, so
+        status='FT' is the primary signal here, not match_date. No FK-based
+        embed to fixtures (composite sport+fixture_id keys, not a declared
+        PostgREST relationship) — fetched and joined in Python instead.
         """
-        now = datetime.now(timezone.utc).isoformat()
-        res = (
+        from datetime import date as _date
+        today = _date.today().isoformat()
+
+        pred_res = (
             self.supabase.table("predictions")
-            .select(
-                "id, match_id, market, predicted_outcome, "
-                "matches(id, sport, match_date, status, home_score, away_score, "
-                "home_team_id, away_team_id, "
-                "sports(slug), "
-                "home:teams!home_team_id(name), away:teams!away_team_id(name))"
-            )
-            .eq("status", "PENDING")
-            .lt("matches.match_date", now)
+            .select("id, sport, fixture_id, market, selection")
+            .is_("is_correct", "null")
             .execute()
         )
-        return res.data or []
+        preds = pred_res.data or []
+        if not preds:
+            return []
+
+        pairs = {(p["sport"], p["fixture_id"]) for p in preds}
+        fx_res = (
+            self.supabase.table("fixtures")
+            .select("sport, fixture_id, match_date, status")
+            .in_("fixture_id", [fid for _, fid in pairs])
+            .or_(f"status.eq.FT,match_date.lt.{today}")
+            .execute()
+        )
+        due_keys = {(r["sport"], r["fixture_id"]) for r in (fx_res.data or [])}
+
+        return [p for p in preds if (p["sport"], p["fixture_id"]) in due_keys]
 
     # ── Core resolution ─────────────────────────────────────────
 
     def _resolve_prediction(self, pred: dict) -> None:
-        match_data = pred.get("matches", {})
-        if not match_data:
+        sport, fixture_id = pred["sport"], pred["fixture_id"]
+
+        result = self._get_or_fetch_result(sport, fixture_id)
+        if result is None:
+            logger.debug("No result yet for %s/%s", sport, fixture_id)
             return
 
-        home_score = match_data.get("home_score")
-        away_score = match_data.get("away_score")
+        is_correct = OutcomeResolver.resolve(pred["market"], pred["selection"], result)
+        actual_outcome = {"H": "Home", "D": "Draw", "A": "Away"}.get(result.get("ftr"), result.get("ftr"))
 
-        # If scores not in DB, fetch from API-Sports
-        if home_score is None or away_score is None:
-            sport_slug = (match_data.get("sports") or {}).get("slug", "football")
-            home_name  = (match_data.get("home") or {}).get("name", "")
-            away_name  = (match_data.get("away") or {}).get("name", "")
-            match_date = match_data.get("match_date", "")
-            api_result = self.api.search_fixture(sport_slug, home_name, away_name, match_date)
-            if not api_result:
-                logger.debug("No API result yet for prediction %d", pred["id"])
-                return
-            home_score, away_score, stats = self._extract_scores_and_stats(api_result)
-            if home_score is None:
-                return
-            # Update match scores in DB
-            self.supabase.table("matches").update({
-                "home_score": home_score,
-                "away_score": away_score,
-                "status":     "finished",
-            }).eq("id", match_data["id"]).execute()
-            # Store match stats
-            self._upsert_match_stats(match_data["id"], stats)
-        else:
-            stats = {}
-
-        # Resolve outcome
-        status = OutcomeResolver.resolve(
-            pred["market"],
-            pred["predicted_outcome"],
-            home_score,
-            away_score,
-        )
-
-        # Determine actual outcome string
-        if home_score > away_score:
-            actual_outcome = "Home"
-        elif away_score > home_score:
-            actual_outcome = "Away"
-        else:
-            actual_outcome = "Draw"
-
-        # Update prediction
         self.supabase.table("predictions").update({
-            "status":         status,
+            "is_correct":    is_correct,
             "actual_outcome": actual_outcome,
+            "settled_at":    datetime.now(timezone.utc).isoformat(),
         }).eq("id", pred["id"]).execute()
 
-        # Write prediction_results row
-        self.supabase.table("prediction_results").upsert({
-            "prediction_id": pred["id"],
-            "actual_result": actual_outcome,
-            "goals_home":    home_score,
-            "goals_away":    away_score,
-            "resolved_at":   datetime.utcnow().isoformat(),
-        }, on_conflict="prediction_id").execute()
-
-        # Update accumulator legs
-        self._update_accumulator_legs(pred["id"], status)
+        self._resolve_accumulator_picks(pred["id"], is_correct, actual_outcome)
 
         self._new_resolutions += 1
-        logger.debug("Prediction %d → %s", pred["id"], status)
-
-    # ── Match stats ─────────────────────────────────────────────
-
-    def _extract_scores_and_stats(self, api_result: dict) -> tuple[int | None, int | None, dict]:
-        goals = api_result.get("goals", {})
-        home_score = goals.get("home")
-        away_score = goals.get("away")
-
-        stats: dict[str, tuple] = {}
-        for team_stat in api_result.get("statistics", []):
-            side = "home" if team_stat.get("team", {}).get("id") == api_result.get("teams", {}).get("home", {}).get("id") else "away"
-            for stat in team_stat.get("statistics", []):
-                stat_type = stat.get("type", "")
-                val = stat.get("value")
-                if stat_type not in stats:
-                    stats[stat_type] = [None, None]
-                idx = 0 if side == "home" else 1
-                stats[stat_type][idx] = self._safe_int(val)
-
-        return home_score, away_score, stats
-
-    def _upsert_match_stats(self, match_id: int, stats: dict) -> None:
-        if not stats:
-            return
-        rows = [
-            {
-                "match_id":   match_id,
-                "stat_type":  stat_type,
-                "home_value": vals[0],
-                "away_value": vals[1],
-            }
-            for stat_type, vals in stats.items()
-        ]
-        if rows:
-            self.supabase.table("match_stats").upsert(
-                rows, on_conflict="match_id,stat_type"
-            ).execute()
+        logger.debug("Prediction %s → %s", pred["id"], "CORRECT" if is_correct else "INCORRECT")
 
     # ── Accumulator resolution ──────────────────────────────────
 
-    def _update_accumulator_legs(self, prediction_id: int, leg_status: str) -> None:
-        """Update the leg, then recompute the parent accumulator status."""
-        # Update the leg
-        self.supabase.table("accumulator_legs").update(
-            {"status": leg_status}
-        ).eq("prediction_id", prediction_id).execute()
-
-        # Find all accumulators containing this prediction
-        legs_res = (
-            self.supabase.table("accumulator_legs")
-            .select("accumulator_id")
+    def _resolve_accumulator_picks(self, prediction_id: int, is_correct: bool, actual_value: str) -> None:
+        """
+        accumulator_picks (not accumulator_legs — that table doesn't exist in
+        the live schema; accumulator_builder.py already writes picks here,
+        keyed by prediction_id) references predictions.id directly, so a
+        settled prediction resolves its picks the same way.
+        """
+        picks_res = (
+            self.supabase.table("accumulator_picks")
+            .select("id, accumulator_id")
             .eq("prediction_id", prediction_id)
             .execute()
         )
-        acca_ids = {row["accumulator_id"] for row in (legs_res.data or [])}
+        picks = picks_res.data or []
+        if not picks:
+            return
 
-        for acca_id in acca_ids:
-            self._recompute_accumulator_status(acca_id)
+        self.supabase.table("accumulator_picks").update({
+            "outcome":      "CORRECT" if is_correct else "INCORRECT",
+            "actual_value": actual_value,
+            "settled":      True,
+            "updated_at":   datetime.now(timezone.utc).isoformat(),
+        }).eq("prediction_id", prediction_id).execute()
 
-    def _recompute_accumulator_status(self, accumulator_id: int) -> None:
+        for acca_id in {p["accumulator_id"] for p in picks}:
+            self._recompute_accumulator(acca_id)
+
+    def _recompute_accumulator(self, accumulator_id: int) -> None:
         """
-        Recompute accumulator status:
-        - If any leg is INCORRECT → LOST
-        - If all legs are CORRECT → WON
-        - Otherwise → still PENDING
+        WON only if every pick is settled AND correct; LOST as soon as any
+        pick is settled INCORRECT (no need to wait for the rest); otherwise
+        left pending — matches accumulators.status/outcome/settled shape.
         """
-        legs_res = (
-            self.supabase.table("accumulator_legs")
-            .select("status")
+        picks_res = (
+            self.supabase.table("accumulator_picks")
+            .select("outcome, settled")
             .eq("accumulator_id", accumulator_id)
             .execute()
         )
-        legs = legs_res.data or []
-        if not legs:
+        picks = picks_res.data or []
+        if not picks:
             return
 
-        statuses = [l["status"] for l in legs]
-        if "INCORRECT" in statuses:
-            new_status = "LOST"
-        elif all(s == "CORRECT" for s in statuses):
-            new_status = "WON"
+        if any(p["settled"] and p["outcome"] == "INCORRECT" for p in picks):
+            outcome = "LOST"
+        elif all(p["settled"] and p["outcome"] == "CORRECT" for p in picks):
+            outcome = "WON"
         else:
-            new_status = "PENDING"
+            return   # still pending — some picks unresolved, none lost yet
 
-        self.supabase.table("accumulators").update(
-            {"status": new_status}
-        ).eq("id", accumulator_id).execute()
-        logger.debug("Accumulator %d → %s", accumulator_id, new_status)
+        self.supabase.table("accumulators").update({
+            "status":     "settled",
+            "outcome":    outcome,
+            "settled":    True,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", accumulator_id).execute()
+        logger.debug("Accumulator %s → %s", accumulator_id, outcome)
+
+    def _get_or_fetch_result(self, sport: str, fixture_id: str) -> dict | None:
+        """Prefer whatever's already in match_results; fall back to a live
+        API-Sports lookup by the real fixture_id and upsert what we find."""
+        res = (
+            self.supabase.table("match_results")
+            .select("home_goals, away_goals, ftr, total_corners, total_cards, status")
+            .eq("sport", sport).eq("fixture_id", fixture_id)
+            .execute()
+        )
+        rows = res.data or []
+        if rows and rows[0].get("home_goals") is not None:
+            return rows[0]
+
+        api_result = self.api.get_fixture(sport, fixture_id)
+        if not api_result:
+            return None
+
+        status_short = api_result.get("fixture", {}).get("status", {}).get("short")
+        if status_short != "FT":
+            return None
+
+        goals = api_result.get("goals", {})
+        hg, ag = goals.get("home"), goals.get("away")
+        if hg is None or ag is None:
+            return None
+
+        teams = api_result.get("teams", {})
+        row = {
+            "sport":       sport,
+            "fixture_id":  fixture_id,
+            "home_team":   (teams.get("home") or {}).get("name", ""),
+            "away_team":   (teams.get("away") or {}).get("name", ""),
+            "status":      "finished",
+            "home_goals":  hg,
+            "away_goals":  ag,
+            # total_goals / goal_diff are DB-generated columns — confirmed live
+            "ftr":         "H" if hg > ag else ("A" if hg < ag else "D"),
+            "btts":        bool(hg > 0 and ag > 0),
+            "over15":      bool((hg + ag) > 1.5),
+            "over25":      bool((hg + ag) > 2.5),
+            "settled_at":  datetime.now(timezone.utc).isoformat(),
+        }
+        self.supabase.table("match_results").upsert(row, on_conflict="sport,fixture_id").execute()
+        return row
 
     # ── Retraining flag ─────────────────────────────────────────
 
@@ -389,13 +370,6 @@ class ResultFetcher:
         except Exception as exc:
             logger.error("Failed to update retrain counter: %s", exc)
 
-    @staticmethod
-    def _safe_int(val: Any) -> int | None:
-        try:
-            return int(float(str(val).replace("%", "")))
-        except (TypeError, ValueError):
-            return None
-
     def close(self):
         self.api.close()
 
@@ -409,36 +383,15 @@ def run_result_scheduler() -> None:
     """
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(
-        _result_job,
+        lambda: ResultFetcher().run(),
         trigger=IntervalTrigger(hours=2),
         id="result_fetcher",
-        name="Resolve PENDING predictions every 2h",
-        max_instances=1,
-        misfire_grace_time=600,
         replace_existing=True,
     )
     scheduler.start()
     logger.info("📅 ResultFetcher scheduler started — interval: 2h")
-    # Trigger immediately on first call
-    _result_job()
     return scheduler
 
 
-def _result_job() -> None:
-    fetcher = ResultFetcher()
-    try:
-        fetcher.run()
-    finally:
-        fetcher.close()
-
-
 if __name__ == "__main__":
-    import time
-    logging.basicConfig(level=logging.INFO)
     run_result_scheduler()
-    # Keep process alive
-    try:
-        while True:
-            time.sleep(3600)
-    except (KeyboardInterrupt, SystemExit):
-        pass

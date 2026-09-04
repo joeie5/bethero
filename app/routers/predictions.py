@@ -64,8 +64,8 @@ async def get_today_accumulators(background_tasks: BackgroundTasks):
             }
         
         # Trigger generation
-        from app.services.accumulator_builder import build_all_accumulators
-        background_tasks.add_task(build_all_accumulators)
+        from app.ml.accumulator_builder import run_accumulator_job
+        background_tasks.add_task(run_accumulator_job)
         
         # Set flag in redis for 15 mins
         redis.setex("acca_generation_in_progress", 900, "true")
@@ -120,8 +120,8 @@ async def get_accumulators_by_type(acca_type: str, background_tasks: BackgroundT
                     }
                 
                 # Trigger generation
-                from app.services.accumulator_builder import build_all_accumulators
-                background_tasks.add_task(build_all_accumulators)
+                from app.ml.accumulator_builder import run_accumulator_job
+                background_tasks.add_task(run_accumulator_job)
                 redis.setex("acca_generation_in_progress", 900, "true")
                 
                 return {
