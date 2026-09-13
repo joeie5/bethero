@@ -12,6 +12,7 @@ Full implementation of BetHeroBaseModel using sklearn RandomForestClassifier.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -45,12 +46,19 @@ class RandomForestBetModel(BetHeroBaseModel):
         sport: str,
         market: str,
         n_trials: int = 25,
-        n_jobs: int = -1,
+        n_jobs: int = int(os.environ.get("BETHERO_RF_N_JOBS", -1)),
         model_dir: Path | None = None,
     ):
         super().__init__(sport, market, model_dir)
         self.n_trials = n_trials
         self.n_jobs   = n_jobs
+        # Memory-constrained (e.g. local CPU-only) runs can cap the Optuna
+        # search space — the default (n_estimators<=1000, max_depth<=30) is
+        # what produced the 2.19GB (1x2) and 1.48GB (Corners_9.5) models,
+        # which is fine on a 32-core/24GB+ GPU rental but can OOM a 16GB
+        # local machine. Vast.ai runs are unaffected (env vars unset there).
+        self._max_n_estimators = int(os.environ.get("BETHERO_RF_MAX_ESTIMATORS", 1000))
+        self._max_depth        = int(os.environ.get("BETHERO_RF_MAX_DEPTH", 30))
         self._rf:     RandomForestClassifier | None = None
         self._cal:    CalibratedClassifierCV | None = None
 
@@ -71,8 +79,8 @@ class RandomForestBetModel(BetHeroBaseModel):
         # ── Optuna tuning ────────────────────────────────────────────────────
         def _obj(trial: optuna.Trial) -> float:
             rf = RandomForestClassifier(
-                n_estimators      = trial.suggest_int("n_estimators", 100, 1000),
-                max_depth         = trial.suggest_int("max_depth", 4, 30, log=True),
+                n_estimators      = trial.suggest_int("n_estimators", 100, self._max_n_estimators),
+                max_depth         = trial.suggest_int("max_depth", 4, self._max_depth, log=True),
                 min_samples_split = trial.suggest_int("min_samples_split", 2, 20),
                 min_samples_leaf  = trial.suggest_int("min_samples_leaf", 1, 15),
                 max_features      = trial.suggest_categorical(

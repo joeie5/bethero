@@ -91,8 +91,11 @@ class FormCalculator:
 
     def compute(self, before_dt: datetime, prefix: str = "home") -> dict[str, float]:
         feats: dict[str, float] = {}
-        # Filter strictly before match time
-        hist = self.df[self.df["match_date"] < before_dt]
+        # self.df is always constructed by the caller (_team_history) already
+        # filtered to strictly-before before_dt, with this same before_dt —
+        # re-filtering here was a guaranteed no-op done on every one of the
+        # ~600k calls in a full feature-cache build.
+        hist = self.df
 
         for w in FORM_WINDOWS:
             window = hist.tail(w)
@@ -176,7 +179,7 @@ class FormCalculator:
 
     def consecutive_streak(self, before_dt: datetime, result_type: str) -> int:
         """How many consecutive W/D/L results ending before match time."""
-        hist = self.df[self.df["match_date"] < before_dt].tail(20)
+        hist = self.df.tail(20)  # self.df is already filtered strictly-before before_dt (see compute())
         streak = 0
         for r in reversed(hist["result"].tolist()):
             if r == result_type:
@@ -225,16 +228,23 @@ class DixonColesEstimator:
         if league_avg == 0:
             return self
 
-        teams = set(hist["home_team_id"].tolist() + hist["away_team_id"].tolist())
-        for tid in teams:
-            home_games  = hist[hist["home_team_id"] == tid]
-            away_games  = hist[hist["away_team_id"] == tid]
-            goals_scored    = (home_games["home_goals"].sum() + away_games["away_goals"].sum())
-            goals_conceded  = (home_games["away_goals"].sum() + away_games["home_goals"].sum())
-            n_games = len(home_games) + len(away_games)
-            if n_games > 0:
-                self._attack[tid]  = _safe_div(goals_scored  / n_games, league_avg, 1.0)
-                self._defense[tid] = _safe_div(goals_conceded / n_games, league_avg, 1.0)
+        # Vectorized attack/defense — was a Python-level loop over every team,
+        # each doing two full boolean-mask filters of `hist` (the dominant
+        # cost of feature building at scale: called on almost every fixture
+        # since the cache key is (league, exact date), and `hist` grows over
+        # a league's whole history). Same technique already used in
+        # _build_league_table just below: stack home/away rows long, groupby
+        # once. league_avg != 0 is already guaranteed above, so every team's
+        # divisor is safe — no _safe_div fallback needed.
+        home = hist[["home_team_id", "home_goals", "away_goals"]].rename(
+            columns={"home_team_id": "team_id", "home_goals": "gf", "away_goals": "ga"})
+        away = hist[["away_team_id", "away_goals", "home_goals"]].rename(
+            columns={"away_team_id": "team_id", "away_goals": "gf", "home_goals": "ga"})
+        long = pd.concat([home, away], ignore_index=True)
+        grp = long.groupby("team_id").agg(gf=("gf", "sum"), ga=("ga", "sum"), n=("gf", "size"))
+
+        self._attack  = ((grp["gf"] / grp["n"]) / league_avg).to_dict()
+        self._defense = ((grp["ga"] / grp["n"]) / league_avg).to_dict()
         return self
 
     def attack(self, team_id: int)  -> float:
@@ -314,15 +324,18 @@ def compute_h2h_features(
     feats["h2h_away_win_rate"] = _safe_div(losses, n)
     feats["h2h_avg_goals"]     = ((h2h["home_goals"] + h2h["away_goals"]).mean())
 
-    # H2H at same venue
-    if venue:
-        venue_h2h = h2h[h2h.get("venue", pd.Series(dtype=str)) == venue]
-        vn = len(venue_h2h)
-        if vn > 0:
-            v_wins = (venue_h2h["h2h_result"] == "W").sum()
-            feats["h2h_venue_win_rate"] = _safe_div(v_wins, vn)
-        else:
-            feats["h2h_venue_win_rate"] = NAN_FILL
+    # H2H at same venue — fixtures.venue is 100% null across all 297,904
+    # historical fixtures in this dataset (never populated by the import),
+    # so the original venue-string match always fell through to NAN_FILL.
+    # Use "current home team was also the home team in that meeting" as a
+    # proxy instead: for football this is effectively the same thing as
+    # "same venue," barring rare neutral-ground fixtures (cup finals etc.),
+    # and h2h already carries home_team_id from all_matches.
+    venue_h2h = h2h[h2h["home_team_id"] == home_id]
+    vn = len(venue_h2h)
+    if vn > 0:
+        v_wins = (venue_h2h["h2h_result"] == "W").sum()
+        feats["h2h_venue_win_rate"] = _safe_div(v_wins, vn)
     else:
         feats["h2h_venue_win_rate"] = NAN_FILL
 
@@ -578,6 +591,8 @@ class FeatureEngineer:
         self._dc_cache:       dict[tuple, DixonColesEstimator] = {}
         self._table_cache:    dict[tuple, dict] = {}
         self._elo_cache:      dict[tuple, dict[int, float]] = {}
+        self._elo_index:      "dict[tuple[str, int], tuple[np.ndarray, np.ndarray]] | None" = None
+        self._team_history_cache: dict[tuple[str, int], pd.DataFrame] = {}
 
         self._offline = data_dir is not None
         self._local: dict[str, pd.DataFrame] = {}
@@ -726,8 +741,8 @@ class FeatureEngineer:
         all_matches = self._load_all_sport_matches(sport)
 
         # ── Per-team history ─────────────────────────────────────
-        home_hist_df = self._team_history(home_id, all_matches, before_dt=match_dt, is_home=True)
-        away_hist_df = self._team_history(away_id, all_matches, before_dt=match_dt, is_home=False)
+        home_hist_df = self._team_history(sport, home_id, all_matches, before_dt=match_dt, is_home=True)
+        away_hist_df = self._team_history(sport, away_id, all_matches, before_dt=match_dt, is_home=False)
 
         home_form_calc = FormCalculator(home_hist_df)
         away_form_calc = FormCalculator(away_hist_df)
@@ -869,14 +884,26 @@ class FeatureEngineer:
         self._match_cache[sport] = df
         return df
 
-    def _team_history(self, team_id: int, all_matches: pd.DataFrame,
-                      before_dt: datetime, is_home: bool) -> pd.DataFrame:
+    def _get_team_full_history(self, sport: str, team_id: int,
+                                all_matches: pd.DataFrame) -> pd.DataFrame:
         """
-        Filter all_matches for team_id, add perspective columns (is_home,
-        goals_for, goals_against, corners_for, corners_against, cards_total,
-        result, clean_sheet, btts, over25).
+        Full enriched (both-perspective), sorted history for one team —
+        every column _team_history() derives, before the point-in-time
+        date filter. Cached per (sport, team_id).
+
+        _team_history() used to redo this whole thing — including an O(n)
+        boolean-mask filter of the entire sport's match table — on EVERY
+        call, and it's called twice per fixture (home + away) unconditionally.
+        That's the same "filter the whole history table every time" cost
+        already fixed for Elo lookups; only the cheap final date filter
+        actually needs to happen per-call.
         """
+        key = (sport, team_id)
+        if key in self._team_history_cache:
+            return self._team_history_cache[key]
+
         if all_matches.empty:
+            self._team_history_cache[key] = all_matches
             return all_matches
 
         # Slice to only the columns this function needs before filtering —
@@ -920,6 +947,19 @@ class FeatureEngineer:
             _enrich(away_games, False),
         ]).sort_values("match_date").reset_index(drop=True)
 
+        self._team_history_cache[key] = combined
+        return combined
+
+    def _team_history(self, sport: str, team_id: int, all_matches: pd.DataFrame,
+                      before_dt: datetime, is_home: bool) -> pd.DataFrame:
+        """
+        Point-in-time history for team_id, add perspective columns (is_home,
+        goals_for, goals_against, corners_for, corners_against, cards_total,
+        result, clean_sheet, btts, over25).
+        """
+        combined = self._get_team_full_history(sport, team_id, all_matches)
+        if combined.empty:
+            return combined
         return combined[combined["match_date"] < pd.Timestamp(before_dt)]
 
     def _load_odds(self, sport: str, fixture_id: str) -> list[dict]:
@@ -939,6 +979,34 @@ class FeatureEngineer:
         )
         return res.data or []
 
+    def _build_elo_index(self) -> None:
+        """
+        One-time index of team_form_cache for O(log n) point-in-time Elo
+        lookups: {(sport, team_id): (sorted_dates, sorted_ratings)}.
+
+        _get_cached_elo() used to re-filter the full team_form_cache
+        DataFrame (and re-parse its as_of_date column to datetime) on
+        EVERY call. That's fine when the table is empty, but with it
+        genuinely populated (~580k rows) each lookup took ~0.15s — at
+        ~600k lookups for a full feature-cache build that's ~25 hours.
+        Building this index once up front makes each lookup a numpy
+        searchsorted against a small per-team array instead.
+        """
+        self._elo_index: dict[tuple[str, int], tuple[np.ndarray, np.ndarray]] = {}
+        tf = self._local.get("team_form_cache", pd.DataFrame())
+        if tf.empty or "elo_rating" not in tf.columns:
+            return
+        tf = tf.dropna(subset=["elo_rating"])
+        if tf.empty:
+            return
+        tf = tf.assign(_as_of=pd.to_datetime(tf["as_of_date"]).values.astype("datetime64[D]"))
+        tf = tf.sort_values(["sport", "team_id", "_as_of"])
+        for (sp, tid), g in tf.groupby(["sport", "team_id"], sort=False):
+            self._elo_index[(sp, tid)] = (
+                g["_as_of"].to_numpy(),
+                g["elo_rating"].to_numpy(dtype=float),
+            )
+
     def _get_cached_elo(self, sport: str, team_id: int, before_dt: datetime) -> float:
         """
         Point-in-time Elo lookup from team_form_cache (pre-aggregated,
@@ -953,19 +1021,16 @@ class FeatureEngineer:
             return cache[team_id]
 
         if self._offline:
-            tf = self._local["team_form_cache"]
+            if self._elo_index is None:
+                self._build_elo_index()
             rating = STARTING_ELO
-            if tf.empty or "sport" not in tf.columns:
-                cache[team_id] = rating
-                return rating
-            hit = tf[
-                (tf["sport"] == sport) & (tf["team_id"] == team_id)
-                & (pd.to_datetime(tf["as_of_date"]) <= pd.Timestamp(before_dt.date()))
-            ]
-            if not hit.empty:
-                latest = hit.sort_values("as_of_date").iloc[-1]
-                if pd.notna(latest.get("elo_rating")):
-                    rating = float(latest["elo_rating"])
+            idx = self._elo_index.get((sport, team_id))
+            if idx is not None:
+                dates_arr, ratings_arr = idx
+                target = np.datetime64(before_dt.date(), "D")
+                pos = np.searchsorted(dates_arr, target, side="right") - 1
+                if pos >= 0:
+                    rating = float(ratings_arr[pos])
             cache[team_id] = rating
             return rating
 

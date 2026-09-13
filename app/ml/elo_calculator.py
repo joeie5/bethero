@@ -135,7 +135,7 @@ class EloSnapshot:
     """One stored Elo rating snapshot for a team at a point in time."""
     team_id:      int
     rating:       float
-    match_id:     int | None
+    match_id:     str | None
     calculated_at: datetime
 
 
@@ -242,9 +242,9 @@ class EloCalculator:
     def _process_match(self, match: dict) -> None:
         home_id    = match["home_team_id"]
         away_id    = match["away_team_id"]
-        home_score = match.get("home_score", 0) or 0
-        away_score = match.get("away_score", 0) or 0
-        match_id   = match["id"]
+        home_score = match.get("home_goals", 0) or 0
+        away_score = match.get("away_goals", 0) or 0
+        match_id   = match["fixture_id"]
         league     = match.get("league_name", "")
         round_name = match.get("round")
         season     = match.get("season", "")
@@ -322,60 +322,84 @@ class EloCalculator:
 
     def _load_matches(self) -> list[dict]:
         """
-        Load all finished matches with league name joined.
-        Ordered by match_date ASC so we process history chronologically.
-        Pagination: 10 000 rows per page.
+        Load all finished matches (fixtures joined with match_results) with
+        league name attached. Ordered by (match_date, fixture_id) ASC so we
+        process history chronologically.
+
+        Uses keyset pagination (not offset/range) — with ~300k rows, a
+        large OFFSET forces Postgres to scan-and-discard everything before
+        it on every page, which gets slower each page and eventually hits
+        the statement timeout. Keyset pagination filters on the last row
+        seen instead, so every page is equally fast regardless of depth.
         """
         all_matches: list[dict] = []
-        page_size   = 10_000
-        offset      = 0
+        page_size   = 1_000   # Supabase/PostgREST caps responses at 1000 rows regardless of requested range
+        last_date: str | None = None
+        last_id:   str | None = None
 
         while True:
-            res = (
-                self.client.table("matches")
+            query = (
+                self.client.table("fixtures")
                 .select(
-                    "id, home_team_id, away_team_id, home_score, away_score,"
-                    " match_date, season, round,"
-                    " leagues!inner(name)"
+                    "fixture_id, home_team_id, away_team_id, match_date,"
+                    " season, round, league_name,"
+                    " match_results!inner(home_goals, away_goals)"
                 )
                 .eq("sport", self.sport_slug)
-                .eq("status", "finished")
-                .not_.is_("home_score", "null")
-                .not_.is_("away_score", "null")
+                .eq("status", "FT")
                 .order("match_date", desc=False)
-                .range(offset, offset + page_size - 1)
-                .execute()
+                .order("fixture_id", desc=False)
+                .limit(page_size)
             )
+            if last_date is not None:
+                query = query.or_(
+                    f"match_date.gt.{last_date},"
+                    f"and(match_date.eq.{last_date},fixture_id.gt.{last_id})"
+                )
+            res = query.execute()
             batch = res.data or []
+            if not batch:
+                break
             for m in batch:
-                league_info = m.pop("leagues", {}) or {}
-                m["league_name"] = league_info.get("name", "")
-            all_matches.extend(batch)
+                mr = m.pop("match_results", {}) or {}
+                m["home_goals"] = mr.get("home_goals")
+                m["away_goals"] = mr.get("away_goals")
+            all_matches.extend(
+                m for m in batch if m["home_goals"] is not None and m["away_goals"] is not None
+            )
+            last_date = batch[-1]["match_date"]
+            last_id   = batch[-1]["fixture_id"]
             if len(batch) < page_size:
                 break
-            offset += page_size
 
         return all_matches
 
     def _flush_snapshots(self) -> None:
-        """Write all collected EloSnapshots to Supabase in one batched upsert."""
+        """
+        Write all collected EloSnapshots into team_form_cache — the live
+        table app.ml.feature_engineer._get_cached_elo() actually reads from.
+        Keyed on (sport, team_id, as_of_date): if a team plays more than
+        once on the same date, only the last snapshot for that date wins,
+        which is what a point-in-time lookup wants anyway.
+        """
         if not self._snapshots:
             return
-        rows = [
-            {
-                "team_id":      s.team_id,
-                "rating":       round(s.rating, 4),
-                "match_id":     s.match_id,
-                "calculated_at": s.calculated_at.isoformat(),
+        dedup: dict[tuple[str, int, str], dict] = {}
+        for s in self._snapshots:
+            as_of_date = s.calculated_at.date().isoformat()
+            dedup[(self.sport_slug, s.team_id, as_of_date)] = {
+                "sport":       self.sport_slug,
+                "team_id":     s.team_id,
+                "as_of_date":  as_of_date,
+                "elo_rating":  round(s.rating, 4),
             }
-            for s in self._snapshots
-        ]
+        rows = list(dedup.values())
         total = len(rows)
         for start in range(0, total, self.BATCH_SIZE):
             batch = rows[start : start + self.BATCH_SIZE]
             try:
-                self.client.table("elo_ratings").upsert(
-                    batch, on_conflict="team_id,calculated_at"
+                self.client.table("team_form_cache").upsert(
+                    batch, on_conflict="sport,team_id,as_of_date"
                 ).execute()
             except Exception as exc:
                 logger.error(

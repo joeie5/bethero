@@ -118,6 +118,20 @@ class FootballImporter(BaseImporter):
 
     def _normalize_main_tier(self, df: pd.DataFrame) -> pd.DataFrame:
         is_main = bool(MAIN_TIER_MARKERS & set(df.columns))
+
+        # Fallback Div for rows where it's blank in the source CSV — seen in
+        # practice for the newest rows of a just-downloaded season file
+        # (football-data.co.uk sometimes ships the latest matches without
+        # Div filled in yet). Since every source file is single-division,
+        # the file's own most common non-null Div is always the right answer
+        # — safer than leaving these rows as "Unknown League" (which is what
+        # silently dropped an entire season out of League_key='E0' filtering).
+        if "div" in df.columns:
+            non_null_divs = df["div"].dropna().astype(str).str.strip()
+            fallback_div = non_null_divs.mode().iloc[0] if not non_null_divs.empty else ""
+        else:
+            fallback_div = ""
+
         rows = []
         for _, r in df.iterrows():
             date_val = r.get("date")
@@ -126,6 +140,8 @@ class FootballImporter(BaseImporter):
             parsed = self._parse_date(str(date_val))
             div_raw = r.get("div")
             div = "" if div_raw is None or pd.isna(div_raw) else str(div_raw).strip()
+            if not div:
+                div = fallback_div
             league_name, country = DIVISION_MAP.get(div, ("Unknown League", ""))
 
             fthg, ftag = self._safe_int(r.get("fthg")), self._safe_int(r.get("ftag"))

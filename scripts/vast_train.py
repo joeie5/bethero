@@ -1,10 +1,17 @@
 """
 vast_train.py — CLI training driver for a Vast.ai GPU rental.
 
-Same resumable, skip-if-already-trained loop as notebooks/train_on_colab.ipynb,
-but as a plain script for a real SSH session instead of Colab cells — meant
-to be run inside tmux/screen so it survives SSH disconnects (see
-scripts/vast_setup.sh).
+Per-model resumable (not just per-market): checks each of the 48
+(market, model) files individually against the feature cache's rebuild
+time, so an instance interruption, SSH disconnect, or crash mid-market
+only costs whatever single model was actively training — re-running this
+script picks up exactly where it left off. Meant to be run inside
+tmux/screen so it survives SSH disconnects (see scripts/vast_setup.sh).
+
+Also disables MLflow's local artifact copy (mlflow.log_artifact
+duplicates every saved model into ./mlruns/ — harmless with Vast.ai's
+larger disk, but wasteful and unnecessary since the real model files are
+already saved to MODEL_DIR by model.save()).
 
 Usage:
     python3 scripts/vast_train.py --markets all --n-trials 20
@@ -12,9 +19,7 @@ Usage:
     python3 scripts/vast_train.py --markets Cards_3.5 --n-trials 10 --dry-run
 
 Progress is printed with flush=True after every model and every market, so
-`tail -f` on a redirected log file shows real-time progress (see the
-`nohup ... > train.log 2>&1 &` pattern in the deploy guide as an alternative
-to tmux).
+`tail -f` on a redirected log file shows real-time progress.
 """
 from __future__ import annotations
 
@@ -29,8 +34,23 @@ ALL_MARKETS = [
     "1x2",
 ]
 
+# registry key -> class name used in saved filenames
+MODEL_KEY_TO_CLASS = {
+    "random_forest":  "RandomForestBetModel",
+    "xgboost":        "XGBoostBetModel",
+    "lightgbm":       "LightGBMBetModel",
+    "neural_network": "NeuralNetworkBetModel",
+    "lstm":           "LSTMBetModel",
+}
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = REPO_ROOT / "data_snapshot"
+
+
+def _is_fresh(model_dir: Path, class_name: str, market: str, cutoff: float) -> bool:
+    ext = "pt" if class_name in ("NeuralNetworkBetModel", "LSTMBetModel") else "joblib"
+    f = model_dir / f"{class_name}_football_{market}.{ext}"
+    return f.exists() and f.stat().st_mtime > cutoff
 
 
 def main() -> None:
@@ -53,34 +73,75 @@ def main() -> None:
 
     # Imported here, not at module level, so --help works even before
     # app.ml.* (and its Supabase client construction) is importable.
+    import mlflow
+    mlflow.log_artifact = lambda *a, **kw: None  # see module docstring
+
     from app.ml.models import MODEL_DIR
-    from app.ml.training_pipeline_logic import train_market
+    from app.ml.training_pipeline_logic import (
+        ModelTrainer, MLflowLogger, PipelineConfig, TrainingDataLoader,
+    )
+    from app.database import get_supabase_admin
+
+    feature_cache = args.data_dir / "feature_cache_football.parquet"
+    cutoff = feature_cache.stat().st_mtime if feature_cache.exists() else 0.0
 
     print(f"MODEL_DIR: {MODEL_DIR}")
     print(f"DATA_DIR:  {args.data_dir}")
     print(f"Markets:   {markets}")
     print(f"n_trials={args.n_trials}  n_meta_trials={args.n_meta_trials}  limit={args.limit}  dry_run={args.dry_run}")
+    print(f"Freshness cutoff: {time.ctime(cutoff) if cutoff else '(no existing feature cache — nothing skipped)'}")
 
+    client = get_supabase_admin()
+    mlflow_logger = MLflowLogger()
     grand_t0 = time.monotonic()
+
     for model_key in markets:
-        ensemble_path = MODEL_DIR / f"StackingEnsemble_football_{model_key}.joblib"
-        if ensemble_path.exists() and not args.dry_run:
-            print(f"=== {model_key}: already trained, skipping ({ensemble_path}) ===", flush=True)
+        print(f"\n=== {model_key} ===", flush=True)
+
+        needed = [
+            key for key, cls_name in MODEL_KEY_TO_CLASS.items()
+            if not (_is_fresh(MODEL_DIR, cls_name, model_key, cutoff) and not args.dry_run)
+        ]
+        ensemble_fresh = _is_fresh(MODEL_DIR, "StackingEnsemble", model_key, cutoff) and not args.dry_run
+
+        if not needed and ensemble_fresh:
+            print(f"  {model_key}: all 6 models already fresh, skipping", flush=True)
             continue
 
-        print(f"\n=== {model_key} — starting (limit={args.limit}) ===", flush=True)
         t0 = time.monotonic()
-        results = train_market(
-            "football", model_key,
-            n_trials=args.n_trials, n_meta_trials=args.n_meta_trials,
-            limit=args.limit, data_dir=args.data_dir, dry_run=args.dry_run,
+        df = TrainingDataLoader(client, data_dir=args.data_dir).load(
+            "football", model_key, limit=args.limit,
         )
-        elapsed = time.monotonic() - t0
-        for r in results:
-            print(f"  {r.model_name}: {r.status} {r.error or ''} ({r.duration_s}s)", flush=True)
-            if r.calibration_table is not None:
-                print(r.calibration_table.to_string(index=False), flush=True)
-        print(f"{model_key} done in {elapsed/60:.1f} min", flush=True)
+        if df is None:
+            print(f"  {model_key}: no data, skipping", flush=True)
+            continue
+
+        for key in needed:
+            cls_name = MODEL_KEY_TO_CLASS[key]
+            m0 = time.monotonic()
+            cfg = PipelineConfig(sport="football", market=model_key, model_name=key,
+                                  n_trials=args.n_trials, n_meta_trials=args.n_meta_trials,
+                                  dry_run=args.dry_run)
+            res = ModelTrainer(cfg, mlflow_logger, df=df).run()
+            print(f"  {cls_name}: {res.status} {res.error or ''} ({time.monotonic()-m0:.1f}s)", flush=True)
+            if res.status == "failed":
+                print(f"  {model_key}: aborting ensemble stage due to base model failure", flush=True)
+                break
+        else:
+            if not ensemble_fresh:
+                m0 = time.monotonic()
+                cfg = PipelineConfig(sport="football", market=model_key, model_name="StackingEnsemble",
+                                      n_trials=args.n_trials, n_meta_trials=args.n_meta_trials,
+                                      dry_run=args.dry_run)
+                res = ModelTrainer(cfg, mlflow_logger, df=df).run()
+                print(f"  StackingEnsemble: {res.status} {res.error or ''} ({time.monotonic()-m0:.1f}s)", flush=True)
+                if res.calibration_table is not None:
+                    print(res.calibration_table.to_string(index=False), flush=True)
+            else:
+                print(f"  StackingEnsemble: already fresh, skipping", flush=True)
+
+        del df
+        print(f"{model_key} done in {(time.monotonic()-t0)/60:.1f} min", flush=True)
 
     total_elapsed = time.monotonic() - grand_t0
     print(f"\n=== ALL REQUESTED MARKETS DONE ({total_elapsed/3600:.2f} hours total) ===", flush=True)
