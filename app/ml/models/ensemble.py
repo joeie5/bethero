@@ -57,7 +57,8 @@ import pandas as pd
 import optuna
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss, roc_auc_score
-from sklearn.preprocessing import LabelEncoder, label_binarize
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import LabelEncoder, StandardScaler, label_binarize
 from xgboost import XGBClassifier
 
 from app.ml.models.base_model import (
@@ -86,6 +87,26 @@ BASE_MODEL_NAMES: list[str] = [
 ]
 
 META_OPTUNA_TRIALS = 20     # fast — stacked feature space is small
+
+# Base models that saturate into a near-constant output regardless of input
+# for a specific (sport, market) — discovered by directly calling
+# predict_proba on real fixtures with very different feature vectors and
+# seeing near-identical results (e.g. NeuralNetworkBetModel returning
+# ~0.7571 or ~1.0000 for every single Goals_1.5 fixture). Their recorded
+# validation ROC-AUC looked fine, so the weight-based down-weighting in
+# SportWeightRegistry never caught this — the bug is in generalization, not
+# in the validation-time score. Listed here so load_base_models() skips
+# loading them for these markets: the meta-learner still expects the same
+# number of stacked feature columns it was trained on, so removing a base
+# model image from BASE_MODEL_NAMES entirely would break inference (shape
+# mismatch), but skipping the load lets _collect_probas' existing
+# "missing model → uniform probability" fallback neutralize it instead —
+# no retraining required.
+BROKEN_BASE_MODELS: dict[tuple[str, str], set[str]] = {
+    ("football", "Goals_1.5"): {"NeuralNetworkBetModel"},
+    ("football", "Goals_3.5"): {"NeuralNetworkBetModel"},
+    ("football", "Cards_3.5"): {"NeuralNetworkBetModel"},
+}
 
 
 # ─────────────────────────── Per-sport weight registry ────────────────────
@@ -249,6 +270,7 @@ class StackingEnsemble(BetHeroBaseModel):
         """
         search_dir = model_dir or self.model_dir
         loaded: dict[str, bool] = {}
+        skip = BROKEN_BASE_MODELS.get((self.sport, self.market), set())
 
         candidates: list[tuple[str, type[BetHeroBaseModel], list[str]]] = [
             ("RandomForestBetModel",  RandomForestBetModel,  [".joblib"]),
@@ -259,6 +281,16 @@ class StackingEnsemble(BetHeroBaseModel):
         ]
 
         for model_name, cls, exts in candidates:
+            if model_name in skip:
+                logger.warning(
+                    "[Ensemble] Skipping %s for %s/%s — known to saturate "
+                    "into a near-constant output for this market; the "
+                    "stacked feature builder falls back to a neutral "
+                    "uniform probability for it instead.",
+                    model_name, self.sport, self.market,
+                )
+                loaded[model_name] = False
+                continue
             ok = False
             for ext in exts:
                 pattern = f"{model_name}_{self.sport}_{self.market}{ext}"
@@ -432,7 +464,7 @@ class StackingEnsemble(BetHeroBaseModel):
             params = base_kw | {
                 "n_estimators":     trial.suggest_int("n_estimators", 50, 500, log=True),
                 "max_depth":        trial.suggest_int("max_depth", 2, 8),
-                "learning_rate":    trial.suggest_float("lr", 0.01, 0.3, log=True),
+                "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
                 "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
                 "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
                 "reg_alpha":        trial.suggest_float("reg_alpha",  1e-8, 5.0, log=True),
@@ -450,12 +482,51 @@ class StackingEnsemble(BetHeroBaseModel):
             sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=5),
         )
         study.optimize(_obj, n_trials=self.n_meta_trials, show_progress_bar=False)
-        logger.info("[Ensemble] Meta best val log-loss: %.4f", study.best_value)
+        logger.info("[Ensemble] Meta best val log-loss (XGBoost): %.4f", study.best_value)
 
         best = base_kw | study.best_params
-        self._meta = XGBClassifier(**best)
-        self._meta.fit(Z_train, y_tr_enc,
-                       eval_set=[(Z_val, y_va_enc)], verbose=False)
+        xgb_meta = XGBClassifier(**best)
+        xgb_meta.fit(Z_train, y_tr_enc, eval_set=[(Z_val, y_va_enc)], verbose=False)
+        xgb_val_ll = log_loss(y_va_enc, xgb_meta.predict_proba(Z_val))
+
+        # XGBoost's own regularization search can converge to a degenerate,
+        # near-constant-output model and call it "optimal" whenever the
+        # base models' real signal is weak relative to validation-set noise
+        # — confirmed live on Goals_1.5/3.5: 91-99% of predictions collapsed
+        # to one identical value, with validation log-loss barely worse than
+        # genuinely varied alternatives (a collapsed model minimizes
+        # variance at near-zero bias cost on a small, imbalanced val set,
+        # which pure log-loss can't tell apart from real skill). A plain,
+        # scaled logistic regression can't take that shortcut — it's linear,
+        # so it MUST respond to input variation unless the true relationship
+        # really is flat. Fit a small regularization sweep and keep it
+        # instead whenever it genuinely wins on held-out log-loss (tested:
+        # C=1e-4 beat both XGBoost and the naive base-rate baseline on
+        # Goals_1.5 — 0.533 vs 0.545 naive vs XGBoost's collapsed ~0.55).
+        lr_scaler = StandardScaler()
+        Zs_train = lr_scaler.fit_transform(Z_train)
+        Zs_val = lr_scaler.transform(Z_val)
+        best_lr_meta, best_lr_ll = None, float("inf")
+        for C in (1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 0.1, 0.3, 1.0):
+            # multi_class was removed from LogisticRegression's constructor
+            # in the scikit-learn version installed here (confirmed live:
+            # TypeError on the kwarg) — multiclass targets are handled
+            # automatically now, no explicit strategy needed.
+            lr_mdl = LogisticRegression(C=C, max_iter=2000)
+            lr_mdl.fit(Zs_train, y_tr_enc)
+            ll = log_loss(y_va_enc, lr_mdl.predict_proba(Zs_val))
+            if ll < best_lr_ll:
+                best_lr_ll, best_lr_meta = ll, lr_mdl
+        logger.info("[Ensemble] Best val log-loss (LogisticRegression, C=%.4g): %.4f",
+                    best_lr_meta.C, best_lr_ll)
+
+        if best_lr_ll < xgb_val_ll:
+            logger.info("[Ensemble] Using LogisticRegression meta-learner — genuinely "
+                         "beat XGBoost on held-out log-loss (%.4f < %.4f)", best_lr_ll, xgb_val_ll)
+            self._meta = Pipeline([("scaler", lr_scaler), ("clf", best_lr_meta)])
+            best = {"model": "LogisticRegression", "C": best_lr_meta.C}
+        else:
+            self._meta = xgb_meta
 
         val_proba = self._meta.predict_proba(Z_val)
         train_ll  = log_loss(y_tr_enc, self._meta.predict_proba(Z_train))

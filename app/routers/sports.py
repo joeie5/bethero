@@ -19,14 +19,14 @@ router = APIRouter(
     tags=["Sports"]
 )
 
-@router.get("/", response_model=List[SportOut])
+@router.get("/")
 async def get_sports():
     """
     List all supported sports.
     """
     supabase = get_supabase_admin()
     try:
-        res = supabase.table("sports").select("*").execute()
+        res = supabase.table("sports_catalog").select("*").execute()
         data = res.data or []
         return {"data": data, "count": len(data)}
     except Exception as exc:
@@ -59,18 +59,21 @@ async def get_sport_fixtures(sport: str, date: str = None):
     supabase = get_supabase_admin()
     
     try:
-        query = supabase.table("matches")\
+        query = supabase.table("fixtures")\
             .select("*")\
-            .eq("status", "upcoming")\
+            .eq("status", "NS")\
             .order("match_date")
 
         if sport != "all":
             query = query.eq("sport", sport)
 
         if date:
-            query = query\
-                .gte("match_date", f"{date}T00:00:00")\
-                .lte("match_date", f"{date}T23:59:59+23:59")
+            # match_date is a DATE column (no time component) — a plain
+            # equality match is correct and avoids the invalid "+23:59"
+            # timezone offset this used to build (Postgres error 22009,
+            # silently swallowed below into an empty result every time a
+            # date filter was used).
+            query = query.eq("match_date", date)
 
         result = query.limit(500).execute()
         fixtures = result.data or []

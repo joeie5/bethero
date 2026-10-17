@@ -30,6 +30,8 @@ _upstash_client: UpstashRedis | None = None
 
 def _init_upstash_with_retry(retries: int = 3, delay: float = 2.0) -> UpstashRedis:
     """Connect to Upstash with exponential backoff."""
+    if not settings.UPSTASH_REDIS_REST_URL:
+        raise ConnectionError("UPSTASH_REDIS_REST_URL not configured — skipping Redis.")
     last_exc: Exception | None = None
     for attempt in range(1, retries + 1):
         try:

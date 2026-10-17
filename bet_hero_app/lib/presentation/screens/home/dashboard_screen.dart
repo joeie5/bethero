@@ -5,9 +5,10 @@ import '../../../core/theme.dart';
 import '../../../data/models/accumulator_model.dart';
 import '../../providers/accumulator_provider.dart';
 import '../../providers/fixture_provider.dart';
-import '../../widgets/accumulator/accumulator_summary_card.dart';
-import '../../widgets/accumulator/leg_card.dart';
+import '../../widgets/common/sport_icon.dart';
+import '../../widgets/ui/ui_kit.dart';
 
+/// Ports `pages/Home.tsx` — greeting header, tier cards grid, upcoming fixtures.
 class DashboardScreen extends ConsumerWidget {
   const DashboardScreen({super.key});
 
@@ -18,230 +19,196 @@ class DashboardScreen extends ConsumerWidget {
     final selectedSport = ref.watch(selectedSportProvider);
 
     return Scaffold(
-      body: CustomScrollView(
-        slivers: [
-          _buildAppBar(context),
-          SliverToBoxAdapter(
-            child: Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  _buildSectionHeader('Today\'s Summaries'),
-                  const SizedBox(height: 12),
-                  _buildSummaryCards(accasAsync, context),
-                  const SizedBox(height: 32),
-                  _buildSectionHeader('Featured Accumulator'),
-                  const SizedBox(height: 12),
-                  _buildFeaturedCard(accasAsync, context),
-                  const SizedBox(height: 32),
-                  _buildSectionHeader('Upcoming Fixtures'),
-                  const SizedBox(height: 12),
-                  _buildSportFilters(ref),
-                  const SizedBox(height: 12),
-                  _buildFixturesPreview(fixturesAsync, selectedSport),
-                  const SizedBox(height: 100), // Navigation spacing
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildAppBar(BuildContext context) {
-    return SliverAppBar(
-      floating: true,
-      title: Column(
-        children: [
-          const Text('BET HERO', style: TextStyle(letterSpacing: 2, fontWeight: FontWeight.bold)),
-          Text(
-            'TODAY\'S PREDICTIONS',
-            style: TextStyle(color: AppTheme.primaryGold, fontSize: 10, letterSpacing: 1.5),
-          ),
-        ],
-      ),
-      actions: [
-        IconButton(
-          onPressed: () => context.push('/notifications'),
-          icon: const Icon(Icons.notifications_none),
-        ),
-        IconButton(
-          onPressed: () => context.push('/settings'),
-          icon: const Icon(Icons.person_outline),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildSectionHeader(String title) {
-    return Text(
-      title,
-      style: const TextStyle(
-        fontSize: 18,
-        fontWeight: FontWeight.bold,
-        letterSpacing: 0.5,
-      ),
-    );
-  }
-
-  Widget _buildSummaryCards(AsyncValue<List<AccumulatorModel>> accasAsync, BuildContext context) {
-    return accasAsync.when(
-      data: (accas) {
-        return SizedBox(
-          height: 100,
-          child: Row(
-            children: [
-              _summaryCard(accas, AccaType.ten, context, 0),
-              const SizedBox(width: 12),
-              _summaryCard(accas, AccaType.five, context, 1),
-              const SizedBox(width: 12),
-              _summaryCard(accas, AccaType.three, context, 2),
-            ],
-          ),
-        );
-      },
-      loading: () => const SizedBox(height: 100, child: Center(child: CircularProgressIndicator())),
-      error: (e, _) => const Text('Failed to load accumulators'),
-    );
-  }
-
-  Widget _summaryCard(List<AccumulatorModel> accas, AccaType type, BuildContext context, int index) {
-    final acca = accas.firstWhere((a) => a.type == type, orElse: () => _emptyAcca(type));
-    return Expanded(
-      child: AccumulatorSummaryCard(
-        accumulator: acca,
-        index: index,
-        onTap: () => context.push('/accumulator/${type.value}?index=$index'),
-      ),
-    );
-  }
-
-  Widget _buildFeaturedCard(AsyncValue<List<AccumulatorModel>> accasAsync, BuildContext context) {
-    return accasAsync.when(
-      data: (accas) {
-        final featured = accas.isEmpty 
-            ? _emptyAcca(AccaType.ten)
-            : accas.firstWhere((a) => a.type == AccaType.ten, orElse: () => accas.first);
-        return Hero(
-          tag: 'acca_${featured.id}_10',
-          child: Material(
-            color: Colors.transparent,
-            child: Container(
-              decoration: BoxDecoration(
-                color: AppTheme.cardBackground,
-                borderRadius: BorderRadius.circular(16),
-                border: Border(
-                  bottom: BorderSide(
-                    color: Colors.white.withValues(alpha: 0.05),
-                    width: 1.0,
-                  ),
-                ),
-              ),
-              child: Column(
-                children: [
-                  Padding(
-                    padding: const EdgeInsets.all(16.0),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text('10 ODDS COMBO', style: TextStyle(fontWeight: FontWeight.bold)),
-                        Text('${featured.totalOdds.toStringAsFixed(2)} ODDS', style: const TextStyle(color: AppTheme.primaryGold, fontWeight: FontWeight.bold)),
+      backgroundColor: AppColors.base,
+      body: SafeArea(
+        child: CustomScrollView(
+          slivers: [
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: const [
+                        LogoMark(size: 30),
+                        SizedBox(width: 10),
+                        Wordmark(fontSize: 20),
                       ],
                     ),
-                  ),
-                  ...featured.legs.take(3).map((leg) => Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    child: LegCard(leg: leg),
-                  )),
-                  Padding(
-                    padding: const EdgeInsets.all(16.0),
-                    child: SizedBox(
-                      width: double.infinity,
-                      child: ElevatedButton(
-                        onPressed: () => context.push('/accumulator/${featured.type.value}?index=10'),
-                        child: const Text('View Full Analysis'),
-                      ),
+                    Row(
+                      children: [
+                        IconButton(
+                          onPressed: () => context.push('/notifications'),
+                          icon: const Icon(Icons.notifications_none, color: AppColors.inkMuted),
+                        ),
+                        IconButton(
+                          onPressed: () => context.push('/settings'),
+                          icon: const Icon(Icons.person_outline, color: AppColors.inkMuted),
+                        ),
+                      ],
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
-          ),
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      "Today's AI Tickets",
+                      style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800, color: AppColors.ink),
+                    ),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'Ranked by risk. Updated pre-kickoff.',
+                      style: TextStyle(fontSize: 13, color: AppColors.inkMuted),
+                    ),
+                    const SizedBox(height: 20),
+                    _buildTierCards(accasAsync),
+                    const SizedBox(height: 28),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text('Upcoming Fixtures',
+                            style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: AppColors.ink)),
+                        GestureDetector(
+                          onTap: () => context.push('/sports'),
+                          child: const Text('See all',
+                              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.tier3)),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                  ],
+                ),
+              ),
+            ),
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.only(left: 20),
+                child: _buildSportFilters(ref),
+              ),
+            ),
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 12, 20, 12),
+                child: _buildFixturesPreview(fixturesAsync, selectedSport),
+              ),
+            ),
+            const SliverToBoxAdapter(child: ResponsibleFooter()),
+            const SliverToBoxAdapter(child: SizedBox(height: 90)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTierCards(AsyncValue<List<AccumulatorModel>> accasAsync) {
+    return accasAsync.when(
+      data: (accas) {
+        AccumulatorModel findOrEmpty(AccaType t) =>
+            accas.firstWhere((a) => a.type == t, orElse: () => _emptyAcca(t));
+        return Column(
+          children: [
+            TierCard(ticket: findOrEmpty(AccaType.three), tierId: '3'),
+            const SizedBox(height: 14),
+            TierCard(ticket: findOrEmpty(AccaType.five), tierId: '5'),
+            const SizedBox(height: 14),
+            TierCard(ticket: findOrEmpty(AccaType.ten), tierId: '10'),
+          ],
         );
       },
-      loading: () => const Center(child: CircularProgressIndicator()),
-      error: (e, _) => const SizedBox.shrink(),
+      loading: () => const Column(
+        children: [SkeletonTierCard(), SizedBox(height: 14), SkeletonTierCard(), SizedBox(height: 14), SkeletonTierCard()],
+      ),
+      error: (e, _) => EmptyState(
+        icon: Icons.error_outline,
+        title: "Couldn't load tickets",
+        body: 'Pull to refresh or check your connection.',
+      ),
     );
   }
 
   Widget _buildSportFilters(WidgetRef ref) {
-    final sports = ['All', 'Football', 'Basketball', 'Tennis', 'NFL', 'Cricket', 'NHL', 'MLB'];
+    final sports = ['all', 'football', 'basketball', 'nfl', 'mlb', 'nhl', 'tennis', 'cricket'];
     final selected = ref.watch(selectedSportProvider);
-
-    return SizedBox(
-      height: 40,
-      child: ListView.builder(
-        scrollDirection: Axis.horizontal,
-        itemCount: sports.length,
-        itemBuilder: (context, index) {
-          final sport = sports[index];
-          final isSelected = selected.toLowerCase() == sport.toLowerCase();
-          return Padding(
-            padding: const EdgeInsets.only(right: 8),
-            child: FilterChip(
-              label: Text(sport),
-              selected: isSelected,
-              onSelected: (val) => ref.read(selectedSportProvider.notifier).state = sport.toLowerCase(),
-              selectedColor: AppTheme.primaryGold,
-              labelStyle: TextStyle(color: isSelected ? Colors.black : Colors.white),
-            ),
-          );
-        },
-      ),
+    return FilterChips(
+      options: sports
+          .map((s) => ChipOption(id: s, label: s == 'all' ? 'All' : s[0].toUpperCase() + s.substring(1)))
+          .toList(),
+      value: selected,
+      accent: AppColors.tier3,
+      onChanged: (v) => ref.read(selectedSportProvider.notifier).state = v,
     );
   }
 
   Widget _buildFixturesPreview(AsyncValue<List> fixturesAsync, String selectedSport) {
     return fixturesAsync.when(
       data: (fixtures) {
-        final filtered = selectedSport == 'all' 
-          ? fixtures 
-          : fixtures.where((f) => f.sport.toLowerCase() == selectedSport).toList();
-
+        final filtered = selectedSport == 'all'
+            ? fixtures
+            : fixtures.where((f) => f.sport.toLowerCase() == selectedSport).toList();
+        if (filtered.isEmpty) {
+          return const EmptyState(
+            icon: Icons.event_busy,
+            title: 'No fixtures',
+            body: 'No upcoming fixtures for this sport right now.',
+          );
+        }
         return SizedBox(
-          height: 120,
-          child: ListView.builder(
+          height: 128,
+          child: ListView.separated(
             scrollDirection: Axis.horizontal,
             itemCount: filtered.length,
+            separatorBuilder: (_, __) => const SizedBox(width: 10),
             itemBuilder: (context, index) {
               final fixture = filtered[index];
-              return Container(
-                width: 200,
-                margin: const EdgeInsets.only(right: 12),
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: AppTheme.cardBackground,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text(fixture.homeTeam, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-                    const Text('vs', style: TextStyle(color: AppTheme.textSecondary, fontSize: 10)),
-                    Text(fixture.awayTeam, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-                    const SizedBox(height: 8),
-                    Text(fixture.matchDate.toString().substring(11, 16), style: const TextStyle(color: AppTheme.primaryGold, fontSize: 10)),
-                  ],
+              return GlassCard(
+                padding: const EdgeInsets.all(14),
+                onTap: () => context.push('/fixture/${fixture.id}'),
+                child: SizedBox(
+                  width: 168,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          SportIcon(sportSlug: fixture.sport, size: 13, color: AppColors.inkFaint),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(fixture.league,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(fontSize: 10, color: AppColors.inkFaint)),
+                          ),
+                        ],
+                      ),
+                      const Spacer(),
+                      Text(fixture.homeTeam,
+                          maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: AppColors.ink)),
+                      const Text('vs', style: TextStyle(color: AppColors.inkFaint, fontSize: 10)),
+                      Text(fixture.awayTeam,
+                          maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: AppColors.ink)),
+                      const SizedBox(height: 8),
+                      Text(fixture.matchDate.toString().substring(11, 16),
+                          style: AppTheme.numStyle(fontSize: 11, fontWeight: FontWeight.w600, color: AppColors.gold)),
+                    ],
+                  ),
                 ),
               );
             },
           ),
         );
       },
-      loading: () => const Center(child: CircularProgressIndicator()),
-      error: (e, _) => const Text('Fixtures unavailable'),
+      loading: () => const SizedBox(
+        height: 128,
+        child: Row(children: [Expanded(child: SkeletonRow()), SizedBox(width: 10), Expanded(child: SkeletonRow())]),
+      ),
+      error: (e, _) => const Text('Fixtures unavailable', style: TextStyle(color: AppColors.inkMuted)),
     );
   }
 

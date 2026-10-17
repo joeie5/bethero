@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from app.database import get_supabase_admin
 from app.schemas.schemas import PredictionOut, AccumulatorOut, MatchOut
 from app.redis_client import get_redis
+from app.ml.outcome_resolver import resolve_actual_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,8 @@ router = APIRouter(
     tags=["Predictions"]
 )
 
+CURRENT_SEASON = 2026
+
 @router.get("/accumulators/today")
 async def get_today_accumulators(background_tasks: BackgroundTasks):
     """
@@ -27,15 +30,14 @@ async def get_today_accumulators(background_tasks: BackgroundTasks):
     Triggers generation if empty.
     """
     supabase = get_supabase_admin()
-    redis = get_redis()
-    
+
     now = datetime.now(timezone.utc)
     day_ago = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     
     try:
         res = (
             supabase.table("accumulators")
-            .select("*, legs:accumulator_legs(*)")
+            .select("*, legs:accumulator_picks(*)")
             .gte("created_at", day_ago)
             .order("created_at", desc=True)
             .execute()
@@ -46,15 +48,20 @@ async def get_today_accumulators(background_tasks: BackgroundTasks):
             seen_types = set()
             filtered = []
             for acca in res.data:
-                acca_type = acca.get("acca_type")
+                acca_type = acca.get("acc_type")
                 if acca_type not in seen_types:
                     filtered.append(acca)
                     seen_types.add(acca_type)
             
             return {"data": filtered, "count": len(filtered), "source": "database"}
             
-        # check if already generating
-        is_generating = redis.get("acca_generation_in_progress")
+        # check if already generating (Redis is just a duplicate-trigger
+        # guard here — treat "unavailable" the same as "not in progress"
+        # rather than failing the whole request over a cache miss)
+        try:
+            is_generating = get_redis().get("acca_generation_in_progress")
+        except Exception:
+            is_generating = None
         if is_generating:
             return {
                 "status": "generating", 
@@ -67,8 +74,12 @@ async def get_today_accumulators(background_tasks: BackgroundTasks):
         from app.ml.accumulator_builder import run_accumulator_job
         background_tasks.add_task(run_accumulator_job)
         
-        # Set flag in redis for 15 mins
-        redis.setex("acca_generation_in_progress", 900, "true")
+        # Set flag in redis for 15 mins (best-effort — a cache miss here just
+        # means a duplicate generation trigger next call, not a failure)
+        try:
+            get_redis().setex("acca_generation_in_progress", 900, "true")
+        except Exception:
+            pass
         
         return {
             "status": "generating",
@@ -89,28 +100,30 @@ async def get_accumulators_by_type(acca_type: str, background_tasks: BackgroundT
         raise HTTPException(status_code=400, detail="Invalid accumulator type.")
         
     supabase = get_supabase_admin()
-    redis = get_redis()
-    
+
     try:
         res = (
             supabase.table("accumulators")
-            .select("*, legs:accumulator_legs(*)")
-            .eq("acca_type", acca_type)
+            .select("*, legs:accumulator_picks(*)")
+            .eq("acc_type", acca_type)
             .order("created_at", desc=True)
             .limit(10)
             .execute()
         )
         data = res.data or []
-        
+
         if not data:
             # check if today's accas exist at all
             now = datetime.now(timezone.utc)
             day_ago = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-            
+
             check_any = supabase.table("accumulators").select("id").gte("created_at", day_ago).limit(1).execute()
-            
+
             if not check_any.data:
-                is_generating = redis.get("acca_generation_in_progress")
+                try:
+                    is_generating = get_redis().get("acca_generation_in_progress")
+                except Exception:
+                    is_generating = None
                 if is_generating:
                     return {
                         "status": "generating",
@@ -118,11 +131,14 @@ async def get_accumulators_by_type(acca_type: str, background_tasks: BackgroundT
                         "data": [],
                         "count": 0
                     }
-                
+
                 # Trigger generation
                 from app.ml.accumulator_builder import run_accumulator_job
                 background_tasks.add_task(run_accumulator_job)
-                redis.setex("acca_generation_in_progress", 900, "true")
+                try:
+                    get_redis().setex("acca_generation_in_progress", 900, "true")
+                except Exception:
+                    pass
                 
                 return {
                     "status": "generating",
@@ -136,6 +152,131 @@ async def get_accumulators_by_type(acca_type: str, background_tasks: BackgroundT
         logger.error("Error fetching %s accumulators: %s", acca_type, exc)
         raise HTTPException(status_code=500, detail=f"Failed to fetch {acca_type} accumulators.")
 
+@router.get("/longshots")
+async def get_longshots(sport: str = "football", limit: int = 30):
+    """
+    Real long-shot picks (low model probability, by definition low-odds-of-
+    hitting) from completed matches this season, paired with what actually
+    happened. Football only — no other sport has trained models yet, so a
+    non-football `sport` returns an empty list (the client shows a "coming
+    soon" state for those rather than treating it as an error).
+    """
+    if sport not in ("football", "all"):
+        return {"best_bet": None, "data": [], "count": 0}
+
+    supabase = get_supabase_admin()
+    try:
+        # Query each market separately (not one combined query ordered by
+        # generated_at) — otherwise whichever market was generated last
+        # fills the whole result set, since all its rows share the most
+        # recent timestamps.
+        db_markets = ["BTTS", "Cards", "Over_Under_Corners", "Over_Under_Goals", "1X2"]
+        preds: list[dict] = []
+        for m in db_markets:
+            r = (
+                supabase.table("predictions")
+                .select("*")
+                .eq("sport", "football")
+                .eq("market", m)
+                .lt("model_probability", 0.40)
+                .order("model_probability", desc=False)
+                .limit(40)
+                .execute()
+            )
+            preds.extend(r.data or [])
+        if not preds:
+            return {"best_bet": None, "data": [], "count": 0}
+
+        fixture_ids = list({p["fixture_id"] for p in preds})
+        fx_res = (
+            supabase.table("fixtures")
+            .select("fixture_id,home_team,away_team,league_name,match_date,status")
+            .eq("sport", "football")
+            .eq("season", CURRENT_SEASON)
+            .in_("fixture_id", fixture_ids)
+            .execute()
+        )
+        fixtures_by_id = {f["fixture_id"]: f for f in (fx_res.data or [])}
+
+        mr_res = (
+            supabase.table("match_results")
+            .select("fixture_id,btts,total_cards,total_corners,home_goals,away_goals,ftr")
+            .eq("sport", "football")
+            .in_("fixture_id", fixture_ids)
+            .execute()
+        )
+        results_by_id = {r["fixture_id"]: r for r in (mr_res.data or [])}
+
+        rows = []
+        for p in preds:
+            fx = fixtures_by_id.get(p["fixture_id"])
+            if not fx or fx.get("status") != "FT":
+                continue
+            result = results_by_id.get(p["fixture_id"])
+            actual = resolve_actual_outcome(p["market"], p["selection"], result) if result else None
+            if actual is None:
+                continue
+            odds = p.get("odds") or (round(1.0 / p["model_probability"], 2) if p["model_probability"] else None)
+            rows.append({
+                "fixture_id": p["fixture_id"],
+                "sport": "football",
+                "home_team": fx.get("home_team"),
+                "away_team": fx.get("away_team"),
+                "league": fx.get("league_name"),
+                "match_date": fx.get("match_date"),
+                "market": p["market"],
+                "selection": p["selection"],
+                "model_probability": p["model_probability"],
+                "odds": odds,
+                "predicted_outcome": p["selection"],
+                "actual_outcome": actual,
+                "was_correct": p["selection"] == actual,
+            })
+
+        # Diversity cap (mirrors CLAUDE.md's max-2-legs-per-market rule for
+        # accumulators) — otherwise 1X2 "Draw" alone floods the list, since
+        # its baseline probability sits ~33-40% for any three-way market,
+        # crowding out genuinely more extreme longshots from other markets.
+        rows.sort(key=lambda r: r["odds"] or 0, reverse=True)
+        per_market_cap = 6
+        market_counts: dict[str, int] = {}
+        diverse_rows = []
+        for r in rows:
+            c = market_counts.get(r["market"], 0)
+            if c >= per_market_cap:
+                continue
+            market_counts[r["market"]] = c + 1
+            diverse_rows.append(r)
+        rows = diverse_rows[:limit]
+
+        best_bet = None
+        edged = [p for p in preds if p.get("edge")]
+        if edged:
+            best_pred = max(edged, key=lambda p: p["edge"])
+            fx = fixtures_by_id.get(best_pred["fixture_id"])
+            result = results_by_id.get(best_pred["fixture_id"])
+            if fx and result:
+                actual = resolve_actual_outcome(best_pred["market"], best_pred["selection"], result)
+                best_bet = {
+                    "fixture_id": best_pred["fixture_id"],
+                    "home_team": fx.get("home_team"),
+                    "away_team": fx.get("away_team"),
+                    "league": fx.get("league_name"),
+                    "match_date": fx.get("match_date"),
+                    "market": best_pred["market"],
+                    "selection": best_pred["selection"],
+                    "model_probability": best_pred["model_probability"],
+                    "odds": best_pred.get("odds"),
+                    "edge": best_pred.get("edge"),
+                    "actual_outcome": actual,
+                    "was_correct": best_pred["selection"] == actual,
+                }
+
+        return {"best_bet": best_bet, "data": rows, "count": len(rows)}
+    except Exception as exc:
+        logger.error("Error building longshots: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch longshots.")
+
 @router.get("/fixtures/{sport}")
 async def get_sport_fixtures(sport: str):
     """
@@ -144,12 +285,12 @@ async def get_sport_fixtures(sport: str):
     supabase = get_supabase_admin()
     try:
         now = datetime.now(timezone.utc).isoformat()
-        
+
         res = (
-            supabase.table("matches")
+            supabase.table("fixtures")
             .select("*")
             .eq("sport", sport)
-            .eq("status", "upcoming")
+            .eq("status", "NS")
             .gte("match_date", now)
             .order("match_date", desc=False)
             .limit(50)
@@ -162,21 +303,34 @@ async def get_sport_fixtures(sport: str):
         logger.error("Error fetching fixtures for %s: %s", sport, exc)
         raise HTTPException(status_code=500, detail="Failed to fetch fixtures.")
 
-@router.get("/match/{match_id}")
-async def get_match_prediction(match_id: int):
+@router.get("/match/{fixture_id}")
+async def get_match_prediction(fixture_id: str, sport: str = "football"):
     """
     Fetch a specific match and all its associated predictions.
     """
     supabase = get_supabase_admin()
     try:
-        # Fetch match
-        match_res = supabase.table("matches").select("*").eq("id", match_id).single().execute()
-        if not match_res.data:
+        # Fetch match — composite (sport, fixture_id) key, not a bare integer id
+        match_res = (
+            supabase.table("fixtures")
+            .select("*")
+            .eq("sport", sport)
+            .eq("fixture_id", fixture_id)
+            .maybe_single()
+            .execute()
+        )
+        if not match_res or not match_res.data:
             raise HTTPException(status_code=404, detail="Match not found.")
-            
+
         # Fetch predictions
-        pred_res = supabase.table("predictions").select("*").eq("match_id", match_id).execute()
-        
+        pred_res = (
+            supabase.table("predictions")
+            .select("*")
+            .eq("sport", sport)
+            .eq("fixture_id", fixture_id)
+            .execute()
+        )
+
         return {
             "match": match_res.data,
             "predictions": pred_res.data or []
@@ -184,5 +338,5 @@ async def get_match_prediction(match_id: int):
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("Error fetching match data for %d: %s", match_id, exc)
+        logger.error("Error fetching match data for %s/%s: %s", sport, fixture_id, exc)
         raise HTTPException(status_code=500, detail="Failed to fetch match data.")

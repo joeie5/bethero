@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -12,10 +13,16 @@ import 'services/api_service.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
-  
+  // firebase_options.dart only has Android/iOS config — no web Firebase
+  // project has been set up (would need `flutterfire configure` to add
+  // one), so skip Firebase (and the push-notification service that
+  // depends on it) entirely on web rather than crash at startup.
+  if (!kIsWeb) {
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
+  }
+
   // Load environment variables
   await dotenv.load(fileName: ".env");
 
@@ -25,9 +32,11 @@ void main() async {
     anonKey: AppConfig.supabaseAnonKey,
   );
 
-  // Initialize Notification Service
-  final notificationService = NotificationService();
-  await notificationService.initialize();
+  // Initialize Notification Service (Firebase-dependent — mobile only)
+  if (!kIsWeb) {
+    final notificationService = NotificationService();
+    await notificationService.initialize();
+  }
 
   // Test Backend Connection
   final apiService = ApiService();

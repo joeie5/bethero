@@ -1,365 +1,266 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
 import '../../../core/theme.dart';
-
-import '../../../data/models/fixture_model.dart';
 import '../../../data/models/prediction_model.dart';
 import '../../providers/fixture_provider.dart';
-import '../../widgets/fixtures/form_badge.dart';
-import '../../widgets/fixtures/stat_comparison_row.dart';
+import '../../widgets/common/sport_icon.dart';
+import '../../widgets/ui/ui_kit.dart';
+import '../misc/not_found_screen.dart';
 
-
+/// Ports `pages/FixtureDetail.tsx` — match header card (teams + kickoff),
+/// a highlighted "selected for tier" market if this fixture is part of one
+/// of today's accumulators, then every market the model evaluated grouped
+/// by market type, each row showing model probability / odds / edge.
 class FixtureDetailScreen extends ConsumerWidget {
   final String id;
-
   const FixtureDetailScreen({super.key, required this.id});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final fixtureAsync = ref.watch(fixtureDetailProvider(id));
 
-    return DefaultTabController(
-      length: 4,
-      child: Scaffold(
-        appBar: AppBar(
-          title: const Text('MATCH CENTER'),
-          bottom: const TabBar(
-            isScrollable: true,
-            tabs: [
-              Tab(text: 'OVERVIEW'),
-              Tab(text: 'PREDICTIONS'),
-              Tab(text: 'H2H'),
-              Tab(text: 'STATS'),
-            ],
-            indicatorColor: AppTheme.primaryGold,
-            labelColor: AppTheme.primaryGold,
-            unselectedLabelColor: AppTheme.textSecondary,
-          ),
-        ),
-        body: fixtureAsync.when(
-          data: (fixture) {
-            if (fixture == null) return const Center(child: Text('Fixture not found'));
-            return TabBarView(
-              children: [
-                _buildOverviewTab(fixture),
-                _buildPredictionsTab(fixture),
-                _buildH2HTab(fixture),
-                _buildStatsTab(fixture),
-              ],
-            );
-          },
-          loading: () => const Center(child: CircularProgressIndicator()),
-          error: (e, _) => Center(child: Text('Error: $e')),
-        ),
-      ),
-    );
-  }
+    return Scaffold(
+      backgroundColor: AppColors.base,
+      body: fixtureAsync.when(
+        data: (fixture) {
+          if (fixture == null) return const NotFoundScreen();
+          final predictions = [...(fixture.predictions ?? <PredictionModel>[])];
+          predictions.sort((a, b) => b.edge.compareTo(a.edge));
+          final selected = fixture.predictionId != null && predictions.isNotEmpty ? predictions.first : null;
+          final rest = selected == null ? predictions : predictions.where((p) => p != selected).toList();
+          final groups = <String, List<PredictionModel>>{};
+          for (final p in rest) {
+            groups.putIfAbsent(p.market, () => []).add(p);
+          }
 
-  Widget _buildOverviewTab(dynamic fixture) {
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        _buildMatchHeader(fixture),
-        const SizedBox(height: 32),
-        const Text('BOOKMAKER ODDS', style: TextStyle(fontWeight: FontWeight.bold)),
-        const SizedBox(height: 16),
-        _buildOddsSection(fixture),
-        const SizedBox(height: 32),
-        const Text('TEAM FORM (LAST 5)', style: TextStyle(fontWeight: FontWeight.bold)),
-        const SizedBox(height: 16),
-        _buildFormRow('Home Team', ['W', 'D', 'W', 'W', 'L']),
-        _buildFormRow('Away Team', ['L', 'L', 'D', 'W', 'L']),
-      ],
-    );
-  }
-
-  Widget _buildMatchHeader(dynamic fixture) {
-    return Hero(
-      tag: 'fixture_${fixture.id}',
-      child: Container(
-        padding: const EdgeInsets.all(24),
-        decoration: BoxDecoration(
-          color: AppTheme.cardBackground,
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Material(
-          color: Colors.transparent,
-          child: Column(
+          return ListView(
             children: [
-              Text(fixture.league ?? 'LEAGUE', style: const TextStyle(color: AppTheme.primaryGold, fontSize: 10, letterSpacing: 2)),
-              const SizedBox(height: 16),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                children: [
-                  Expanded(child: Text(fixture.homeTeam, textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: AppTheme.textPrimary))),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                    decoration: BoxDecoration(color: AppTheme.secondaryBackground, borderRadius: BorderRadius.circular(4)),
-                    child: Text(
-                      fixture.homeScore != null ? '${fixture.homeScore} - ${fixture.awayScore}' : DateFormat('HH:mm').format(fixture.matchDate.toLocal()),
-                      style: const TextStyle(fontWeight: FontWeight.bold, color: AppTheme.textPrimary),
+              ScreenHeader(
+                title: '${fixture.homeTeam} vs ${fixture.awayTeam}',
+                subtitle: '${fixture.league} · ${DateFormat('HH:mm').format(fixture.matchDate)}',
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    GlassCard(
+                      padding: const EdgeInsets.all(20),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              SportIcon(sportSlug: fixture.sport, size: 14, color: AppColors.inkFaint),
+                              const SizedBox(width: 6),
+                              Text(fixture.league, style: const TextStyle(fontSize: 11, color: AppColors.inkFaint)),
+                              const SizedBox(width: 6),
+                              const Text('·', style: TextStyle(fontSize: 11, color: AppColors.inkFaint)),
+                              const SizedBox(width: 6),
+                              Text('Kick-off ${DateFormat('HH:mm').format(fixture.matchDate)}',
+                                  style: AppTheme.numStyle(fontSize: 11, color: AppColors.inkFaint)),
+                            ],
+                          ),
+                          const SizedBox(height: 16),
+                          Row(
+                            children: [
+                              Expanded(child: _TeamBlock(name: fixture.homeTeam, alignRight: false)),
+                              const Text('vs', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.inkFaint)),
+                              Expanded(child: _TeamBlock(name: fixture.awayTeam, alignRight: true)),
+                            ],
+                          ),
+                          Container(
+                            margin: const EdgeInsets.only(top: 16),
+                            padding: const EdgeInsets.only(top: 12),
+                            decoration: const BoxDecoration(
+                              border: Border(top: BorderSide(color: Colors.white12)),
+                            ),
+                            child: Text(
+                              '${predictions.length} markets evaluated by the model for this fixture.',
+                              style: const TextStyle(fontSize: 11, color: AppColors.inkMuted),
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                  Expanded(child: Text(fixture.awayTeam, textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18, color: AppTheme.textPrimary))),
-                ],
+                    if (selected != null) ...[
+                      const SizedBox(height: 20),
+                      GlassCard(
+                        padding: const EdgeInsets.all(16),
+                        border: Border.all(color: AppColors.tier3.withOpacity(0.33)),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                  decoration: BoxDecoration(
+                                    color: AppColors.tier3.withOpacity(0.12),
+                                    borderRadius: BorderRadius.circular(999),
+                                  ),
+                                  child: const Text('Selected for ticket',
+                                      style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: AppColors.tier3)),
+                                ),
+                                GestureDetector(
+                                  onTap: () => context.push('/ticket/10'),
+                                  child: const Text('Open ticket',
+                                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.tier3)),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            _MarketRow(prediction: selected, highlight: true, accent: AppColors.tier3),
+                          ],
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 24),
+                    const Text('EVERY MARKET EVALUATED',
+                        style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, letterSpacing: 0.6, color: AppColors.inkMuted)),
+                    const SizedBox(height: 4),
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+                      child: Row(
+                        children: [
+                          Expanded(child: Text('Market', style: TextStyle(fontSize: 10, color: AppColors.inkFaint))),
+                          SizedBox(width: 48, child: Text('Model', textAlign: TextAlign.right, style: TextStyle(fontSize: 10, color: AppColors.inkFaint))),
+                          SizedBox(width: 48, child: Text('Odds', textAlign: TextAlign.right, style: TextStyle(fontSize: 10, color: AppColors.inkFaint))),
+                          SizedBox(width: 48, child: Text('Edge', textAlign: TextAlign.right, style: TextStyle(fontSize: 10, color: AppColors.inkFaint))),
+                        ],
+                      ),
+                    ),
+                    if (groups.isEmpty && selected == null)
+                      const EmptyState(icon: Icons.query_stats, title: 'No markets yet', body: 'The model has not evaluated any markets for this fixture.'),
+                    ...groups.entries.map((e) => Padding(
+                          padding: const EdgeInsets.only(top: 12),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Padding(
+                                padding: const EdgeInsets.symmetric(horizontal: 4),
+                                child: Text(e.key.toUpperCase(),
+                                    style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700, letterSpacing: 0.6, color: AppColors.inkFaint)),
+                              ),
+                              const SizedBox(height: 8),
+                              GlassCard(
+                                padding: EdgeInsets.zero,
+                                child: Column(
+                                  children: [
+                                    for (var i = 0; i < e.value.length; i++) ...[
+                                      if (i > 0) const Divider(height: 1, color: Colors.white12),
+                                      _MarketRow(prediction: e.value[i]),
+                                    ],
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        )),
+                  ],
+                ),
               ),
-              const SizedBox(height: 16),
-              Text(DateFormat('EEEE, d MMMM yyyy').format(fixture.matchDate.toLocal()), style: const TextStyle(color: AppTheme.textSecondary, fontSize: 12)),
-              if (fixture.venue != null)
-                Text(fixture.venue!, style: const TextStyle(color: AppTheme.textSecondary, fontSize: 12)),
+              const SizedBox(height: 12),
+              const ResponsibleFooter(),
+              const SizedBox(height: 24),
             ],
-          ),
+          );
+        },
+        loading: () => const Padding(
+          padding: EdgeInsets.all(20),
+          child: Column(children: [SkeletonRow(), SizedBox(height: 12), SkeletonRow(), SizedBox(height: 12), SkeletonRow()]),
         ),
+        error: (e, _) => const NotFoundScreen(),
       ),
     );
   }
+}
 
-  Widget _buildOddsSection(dynamic fixture) {
-    return Row(
-      children: [
-        Expanded(child: _oddsTile('Bet365', fixture.homeOdds ?? 0, 'Home')),
-        const SizedBox(width: 8),
-        Expanded(child: _oddsTile('Betway', fixture.drawOdds ?? 0, 'Draw')),
-        const SizedBox(width: 8),
-        Expanded(child: _oddsTile('1xBet', fixture.awayOdds ?? 0, 'Away')),
-      ],
-    );
+class _TeamBlock extends StatelessWidget {
+  final String name;
+  final bool alignRight;
+  const _TeamBlock({required this.name, required this.alignRight});
+
+  String get _initials {
+    final parts = name.trim().split(RegExp(r'\s+')).take(2);
+    return parts.map((w) => w.isNotEmpty ? w[0] : '').join().toUpperCase();
   }
 
-  Widget _oddsTile(String bookie, double val, String label) {
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(color: AppTheme.cardBackground, borderRadius: BorderRadius.circular(8)),
-      child: Column(
-        children: [
-          Text(bookie, style: const TextStyle(color: AppTheme.textSecondary, fontSize: 10)),
-          const SizedBox(height: 4),
-          Text(val.toStringAsFixed(2), style: const TextStyle(color: AppTheme.primaryGold, fontWeight: FontWeight.bold, fontSize: 16)),
-          Text(label, style: const TextStyle(color: AppTheme.textSecondary, fontSize: 10)),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildFormRow(String team, List<String> form) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(team, style: const TextStyle(color: AppTheme.textPrimary)),
-          Row(
-            children: form.map((res) => Padding(
-              padding: const EdgeInsets.only(left: 4),
-              child: FormBadge(result: res),
-            )).toList(),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildPredictionsTab(FixtureModel fixture) {
-    final predictions = fixture.predictions ?? [];
-    
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        const Text('AI MARKET BREAKDOWN', style: TextStyle(fontWeight: FontWeight.bold)),
-        const SizedBox(height: 16),
-        if (predictions.isEmpty)
-          const Center(
-            child: Padding(
-              padding: EdgeInsets.symmetric(vertical: 32),
-              child: Text(
-                'No detailed predictions available yet.',
-                style: TextStyle(color: AppTheme.textSecondary),
-              ),
-            ),
-          )
-        else
-          ...predictions.map((p) => _buildPredictionCard(p)),
-        const SizedBox(height: 32),
-        if (fixture.predictionId != null)
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(color: AppTheme.primaryGold.withOpacity(0.1), borderRadius: BorderRadius.circular(12)),
-            child: const Row(
-              children: [
-                Icon(Icons.bolt, color: AppTheme.primaryGold),
-                SizedBox(width: 12),
-                Expanded(child: Text('This match is part of today\'s 10-Odds Accumulator!', style: TextStyle(color: AppTheme.primaryGold, fontWeight: FontWeight.bold))),
-              ],
-            ),
-          ),
-      ],
-    );
-  }
-
-  Widget _buildPredictionCard(PredictionModel p) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(16),
+  @override
+  Widget build(BuildContext context) {
+    final avatar = Container(
+      width: 40,
+      height: 40,
+      alignment: Alignment.center,
       decoration: BoxDecoration(
-        color: AppTheme.secondaryBackground,
-        borderRadius: BorderRadius.circular(12),
+        shape: BoxShape.circle,
+        color: Colors.white.withOpacity(0.05),
+        border: Border.all(color: Colors.white24),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(
-                p.market,
-                style: const TextStyle(color: AppTheme.primaryGold, fontWeight: FontWeight.bold, fontSize: 13),
-              ),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                decoration: BoxDecoration(
-                  color: AppTheme.primaryGold.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Text(
-                  p.odds.toStringAsFixed(2),
-                  style: const TextStyle(color: AppTheme.primaryGold, fontWeight: FontWeight.bold, fontSize: 12),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Text(
-            p.predictedOutcome,
-            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: AppTheme.textPrimary),
-          ),
-          const SizedBox(height: 16),
-          _buildDetailConfidenceBar(p.confidenceScore),
-          const SizedBox(height: 12),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(
-                'Edge: +${p.edge.toStringAsFixed(1)}%',
-                style: const TextStyle(color: AppTheme.successGreen, fontSize: 11, fontWeight: FontWeight.bold),
-              ),
-              Text(
-                'Status: ${p.status.toUpperCase()}',
-                style: TextStyle(
-                  color: p.status == 'won' ? AppTheme.successGreen : (p.status == 'lost' ? AppTheme.dangerRed : AppTheme.textSecondary),
-                  fontSize: 10,
-                ),
-              ),
-            ],
-          ),
-          if (p.aiReasoning != null && p.aiReasoning!.isNotEmpty) ...[
-            const SizedBox(height: 12),
-            const Divider(color: Colors.white10),
-            const SizedBox(height: 8),
-            Text(
-              p.aiReasoning!,
-              style: const TextStyle(color: AppTheme.textSecondary, fontSize: 11, fontStyle: FontStyle.italic),
-            ),
-          ],
-        ],
+      child: Text(_initials, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: AppColors.inkMuted)),
+    );
+    final label = Expanded(
+      child: Text(
+        name,
+        textAlign: alignRight ? TextAlign.right : TextAlign.left,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: AppColors.ink),
       ),
     );
+    final children = alignRight ? [label, const SizedBox(width: 10), avatar] : [avatar, const SizedBox(width: 10), label];
+    return Row(children: children);
   }
+}
 
-  Widget _buildDetailConfidenceBar(double confidence) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            const Text('Confidence', style: TextStyle(color: AppTheme.textSecondary, fontSize: 10)),
-            Text('${confidence.toInt()}%', style: const TextStyle(color: AppTheme.textPrimary, fontSize: 10, fontWeight: FontWeight.bold)),
-          ],
-        ),
-        const SizedBox(height: 4),
-        ClipRRect(
-          borderRadius: BorderRadius.circular(2),
-          child: LinearProgressIndicator(
-            value: confidence / 100,
-            backgroundColor: Colors.white.withOpacity(0.05),
-            valueColor: AlwaysStoppedAnimation<Color>(
-              confidence >= 70 ? AppTheme.successGreen : (confidence >= 55 ? AppTheme.primaryGold : Colors.orange),
-            ),
-            minHeight: 4,
-          ),
-        ),
-      ],
-    );
-  }
+class _MarketRow extends StatelessWidget {
+  final PredictionModel prediction;
+  final bool highlight;
+  final Color? accent;
+  const _MarketRow({required this.prediction, this.highlight = false, this.accent});
 
-  Widget _buildH2HTab(dynamic fixture) {
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        const Text('HEAD TO HEAD HISTORY', style: TextStyle(fontWeight: FontWeight.bold)),
-        const SizedBox(height: 16),
-        _h2hRecord(41, 23, 36), // W/D/L percentages for home team
-        const SizedBox(height: 32),
-        const Text('LAST 5 MEETINGS', style: TextStyle(fontWeight: FontWeight.bold)),
-        const SizedBox(height: 16),
-        _h2hMeeting('May 2023', '2 - 1', true),
-        _h2hMeeting('Dec 2022', '0 - 0', null),
-        _h2hMeeting('Oct 2021', '1 - 3', false),
-        _h2hMeeting('Mar 2021', '2 - 2', null),
-        _h2hMeeting('Jan 2020', '3 - 0', true),
-      ],
-    );
-  }
-
-  Widget _h2hRecord(int w, int d, int l) {
-    return Row(
-      children: [
-        _recordPart('W', w, AppTheme.successGreen),
-        _recordPart('D', d, Colors.orange),
-        _recordPart('L', l, AppTheme.dangerRed),
-      ],
-    );
-  }
-
-  Widget _recordPart(String label, int val, Color color) {
-    return Expanded(
-      flex: val,
-      child: Container(
-        height: 30,
-        alignment: Alignment.center,
-        color: color.withOpacity(0.6),
-        child: Text('$val% $label', style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
-      ),
-    );
-  }
-
-  Widget _h2hMeeting(String date, String score, bool? homeWon) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
+  @override
+  Widget build(BuildContext context) {
+    final edgeVal = (prediction.modelProbability - prediction.impliedProbability) * 100;
+    final edgePositive = edgeVal >= 0;
+    return Container(
+      padding: EdgeInsets.symmetric(horizontal: highlight ? 12 : 16, vertical: 12),
+      decoration: highlight
+          ? BoxDecoration(color: Colors.white.withOpacity(0.03), borderRadius: BorderRadius.circular(AppRadius.xl))
+          : null,
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(date, style: const TextStyle(color: AppTheme.textSecondary, fontSize: 12)),
-          Text(score, style: const TextStyle(fontWeight: FontWeight.bold)),
-          FormBadge(result: homeWon == null ? 'D' : (homeWon ? 'W' : 'L')),
+          Expanded(
+            child: Text(
+              prediction.predictedOutcome,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: highlight ? FontWeight.w700 : FontWeight.w500,
+                color: highlight ? (accent ?? AppColors.ink) : AppColors.ink,
+              ),
+            ),
+          ),
+          SizedBox(
+            width: 48,
+            child: Text('${(prediction.modelProbability * 100).toStringAsFixed(0)}%',
+                textAlign: TextAlign.right, style: AppTheme.numStyle(fontSize: 12, color: AppColors.inkMuted)),
+          ),
+          SizedBox(width: 48, child: Align(alignment: Alignment.centerRight, child: OddsDisplay(odds: prediction.odds, size: OddsSize.sm))),
+          SizedBox(
+            width: 48,
+            child: Text(
+              '${edgePositive ? '+' : ''}${edgeVal.toStringAsFixed(1)}',
+              textAlign: TextAlign.right,
+              style: AppTheme.numStyle(fontSize: 12, fontWeight: FontWeight.w600, color: edgePositive ? AppColors.win : AppColors.loss),
+            ),
+          ),
         ],
       ),
-    );
-  }
-
-  Widget _buildStatsTab(dynamic fixture) {
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: const [
-        Text('SEASON COMPARISON', style: TextStyle(fontWeight: FontWeight.bold)),
-        SizedBox(height: 16),
-        StatComparisonRow(label: 'Avg Goals Scored', homeValue: '2.1', awayValue: '1.4', homeRatio: 0.6),
-        StatComparisonRow(label: 'Avg Goals Conceded', homeValue: '0.9', awayValue: '1.8', homeRatio: 0.3),
-        StatComparisonRow(label: 'Shots on Target', homeValue: '6.4', awayValue: '4.2', homeRatio: 0.65),
-        StatComparisonRow(label: 'Possession %', homeValue: '54%', awayValue: '46%', homeRatio: 0.54),
-        StatComparisonRow(label: 'Clean Sheets', homeValue: '12', awayValue: '5', homeRatio: 0.7),
-      ],
     );
   }
 }

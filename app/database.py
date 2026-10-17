@@ -137,7 +137,7 @@ def check_supabase_health() -> bool:
     """Ping the DB via the service client. Returns True if healthy."""
     try:
         client = get_supabase_admin()
-        client.table("sports").select("id").limit(1).execute()
+        client.table("sports_catalog").select("sport").limit(1).execute()
         return True
     except Exception as exc:
         logger.error("Supabase health check failed: %s", exc)

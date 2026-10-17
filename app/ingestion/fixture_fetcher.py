@@ -16,6 +16,7 @@ import httpx
 import asyncio
 from datetime import datetime, timedelta, timezone
 from app.database import get_supabase_admin
+from app.ml.league_key_map import map_league_key
 
 API_KEY = os.getenv("API_SPORTS_KEY", "")
 
@@ -47,16 +48,26 @@ def map_football_fixture(f: dict) -> dict:
     status_short = fixture.get("status", {}).get("short", "NS")
     status = _STATUS_MAP.get(status_short, "NS")
 
+    # fixtures.match_date is DATE and fixtures.kickoff_time is TIME — the
+    # API gives one combined ISO datetime ("2026-09-18T17:00:00+00:00"), so
+    # it must be split, not stuffed whole into both columns (confirmed live:
+    # kickoff_time as TIME rejects a full datetime with error 22007).
+    raw_date = fixture.get("date", "") or ""
+    date_part, _, time_part = raw_date.partition("T")
+
     return {
         "sport":           "football",
         "fixture_id":      str(fixture.get("id")),
         "provider":        "api-sports",
-        "league_key":      str(league.get("id", "")),
+        # Translated to LEAGUE_TIERS's own convention (a football-data.co.uk
+        # code or exact league name) — see app/ml/league_key_map.py's
+        # docstring for why the raw numeric API id can never match a tier.
+        "league_key":      map_league_key(str(league.get("id", ""))),
         "league_name":     league.get("name", "Unknown"),
         "season":          str(league.get("season", "")),
         "round":           league.get("round", ""),
-        "match_date":      fixture.get("date", ""),
-        "kickoff_time":    fixture.get("date", ""),
+        "match_date":      date_part or None,
+        "kickoff_time":    time_part[:8] or None,
         "venue":           (fixture.get("venue") or {}).get("name", ""),
         "referee":         fixture.get("referee") or None,
         "status":          status,
@@ -129,6 +140,41 @@ def _map_odds(f: dict, fixture_id: str) -> dict | None:
     }
 
 
+_team_id_cache: dict[str, int] = {}
+
+
+def _resolve_team_id(supabase, name: str, external_id: str, logo: str) -> int | None:
+    """fixtures.home_team_id/away_team_id FK-reference teams.id (an internal
+    serial PK) — NOT the raw API-Sports team id (confirmed live: API-Sports
+    ids like 19414 don't exist in `teams`, only the small sequential ids
+    from the historical CSV import). Get-or-create by (sport, team_name)."""
+    if not name:
+        return None
+    key = f"football:{name}"
+    if key in _team_id_cache:
+        return _team_id_cache[key]
+
+    existing = (
+        supabase.table("teams").select("id")
+        .eq("sport", "football").eq("team_name", name)
+        .limit(1).execute()
+    )
+    if existing.data:
+        team_id = existing.data[0]["id"]
+    else:
+        created = supabase.table("teams").insert({
+            "sport": "football",
+            "team_name": name,
+            "external_id": external_id or None,
+            "provider": "api-sports",
+            "logo_url": logo or None,
+        }).execute()
+        team_id = created.data[0]["id"]
+
+    _team_id_cache[key] = team_id
+    return team_id
+
+
 async def fetch_football_with_odds() -> int:
     """Pulls the next few days of football fixtures and writes fixtures /
     fixture_odds / (if already finished) match_results, all keyed by the
@@ -169,6 +215,20 @@ async def fetch_football_with_odds() -> int:
                         row = map_football_fixture(f)
                         if not row["home_team"] or not row["fixture_id"] or row["fixture_id"] == "None":
                             continue
+                        # fixtures_status_check only allows a small fixed set
+                        # (confirmed live: 'PST' is rejected) — postponed/
+                        # cancelled/abandoned fixtures aren't useful for
+                        # predictions anyway, so skip rather than fight the
+                        # constraint.
+                        if row["status"] not in ("NS", "LIVE", "FT"):
+                            continue
+
+                        row["home_team_id"] = _resolve_team_id(
+                            supabase, row["home_team"], row["home_team_id"], row["home_team_logo"]
+                        )
+                        row["away_team_id"] = _resolve_team_id(
+                            supabase, row["away_team"], row["away_team_id"], row["away_team_logo"]
+                        )
 
                         supabase.table("fixtures").upsert(
                             row, on_conflict="sport,fixture_id"

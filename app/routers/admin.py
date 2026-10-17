@@ -95,44 +95,11 @@ async def fetch_fixtures(
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-@router.get("/cleanup/fake-fixtures")
-async def cleanup_fake_fixtures():
-    from app.database import get_supabase_admin
-    supabase = get_supabase_admin()
-    result = supabase.table("matches")\
-        .delete()\
-        .eq("status", "upcoming")\
-        .execute()
-    return {"deleted": "all upcoming fixtures"}
-
-@router.get("/cleanup/old-accumulators")
-async def cleanup_old_accumulators():
-    from app.database import get_supabase_admin
-    from datetime import datetime, timedelta
-    supabase = get_supabase_admin()
-    
-    # Keep only today's accumulators
-    today = datetime.now().date().isoformat()
-    
-    # Delete legs first (foreign key)
-    supabase.table("accumulator_legs")\
-        .delete()\
-        .lt("created_at", f"{today}T00:00:00")\
-        .execute()
-    
-    # Delete predictions
-    supabase.table("predictions")\
-        .delete()\
-        .lt("created_at", f"{today}T00:00:00")\
-        .execute()
-    
-    # Delete old accumulators
-    result = supabase.table("accumulators")\
-        .delete()\
-        .lt("created_at", f"{today}T00:00:00")\
-        .execute()
-    
-    return {"status": "cleaned", "message": "Old accumulators removed"}
+# NOTE: /cleanup/fake-fixtures and /cleanup/old-accumulators were disabled after
+# they were identified as the cause of repeated full-table data loss on
+# accumulators/accumulator_picks: both were unauthenticated GET routes that ran
+# unconditional DELETEs, so any crawler, uptime pinger, or browser prefetch
+# hitting the deployed API could wipe production data with no confirmation.
 
 @router.get("/train/status")
 async def get_training_status():

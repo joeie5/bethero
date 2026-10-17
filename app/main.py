@@ -4,7 +4,7 @@ import asyncio
 import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import predictions, results, sports, users, admin
+from app.routers import predictions, results, sports, users, admin, tiers
 from app.config import settings
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -17,6 +17,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def no_store_cache(request, call_next):
+    """Fixtures/predictions/odds change continuously — a browser silently
+    reusing a cached GET response (confirmed live: Chrome kept serving a
+    stale /tiers/days payload through a hard refresh since FastAPI sent no
+    cache headers at all, leaving it to heuristic caching) is worse than
+    the cost of always refetching this small JSON."""
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 @app.get("/health")
 async def health():
@@ -110,6 +122,7 @@ app.include_router(results.router)
 app.include_router(sports.router)
 app.include_router(users.router)
 app.include_router(admin.router)
+app.include_router(tiers.router)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))

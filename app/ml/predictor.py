@@ -73,9 +73,21 @@ MARKET_SPEC: dict[str, dict[str, Any]] = {
         "db_market": "Over_Under_Goals",
         "mode":      "best_edge_across_lines",
         "lines": [
-            {"model_key": "Goals_1.5", "line": 1.5, "selection": "Over 1.5",  "side": "over"},
-            {"model_key": "Goals_2.5", "line": 2.5, "selection": "Over 2.5",  "side": "over"},
-            {"model_key": "Goals_3.5", "line": 3.5, "selection": "Under 3.5", "side": "under"},
+            # baseline_prob: real historical base rate for this exact line
+            # (computed from match_results — see predictor.py's
+            # best_edge_across_lines handling), used as the "implied
+            # probability" fallback when there's no real market odds for
+            # this line (only 2.5 has real bookmaker odds from the CSV
+            # import). Over 1.5 and Under 3.5 are both true ~73% of the
+            # time regardless of the match — using a flat 0.5 (or 0.0)
+            # fallback made their raw ~75% model probability look like a
+            # huge "edge" against 2.5's genuine, much smaller market-based
+            # edge, so this always won the comparison and 2.5/other lines
+            # were never selected — exactly the "collapses to the safest
+            # extreme" failure this mode exists to avoid.
+            {"model_key": "Goals_1.5", "line": 1.5, "selection": "Over 1.5",  "side": "over",  "baseline_prob": 0.737},
+            {"model_key": "Goals_2.5", "line": 2.5, "selection": "Over 2.5",  "side": "over",  "baseline_prob": 0.491},
+            {"model_key": "Goals_3.5", "line": 3.5, "selection": "Under 3.5", "side": "under", "baseline_prob": 0.725},
         ],
     },
     "Corners": {
@@ -348,7 +360,15 @@ class Predictor:
 
         all_results: list[PredictionResult] = []
         for sp, fid in pairs:
-            preds = self.predict_match(sp, fid, markets=markets, persist=True)
+            # This runs unattended (daily scheduled job) — a single fixture
+            # hitting Supabase's intermittent DNS flakiness
+            # ([Errno 11001] getaddrinfo failed, confirmed live) must not
+            # abort the whole batch and lose every fixture after it.
+            try:
+                preds = self.predict_match(sp, fid, markets=markets, persist=True)
+            except Exception:
+                logger.exception("predict_match failed for %s/%s — skipping", sp, fid)
+                continue
             all_results.extend(preds)
         return all_results
 
@@ -372,14 +392,32 @@ class Predictor:
             return [pred] if pred else []
 
         if mode == "best_edge_across_lines":
-            candidates = [
-                self._eval_line(sport, fixture_id, spec["db_market"], line_spec, X, odds, feat_completeness, league_key)
+            paired = [
+                (line_spec, self._eval_line(sport, fixture_id, spec["db_market"], line_spec, X, odds, feat_completeness, league_key))
                 for line_spec in spec["lines"]
             ]
-            candidates = [c for c in candidates if c is not None]
-            if not candidates:
+            paired = [(ls, c) for ls, c in paired if c is not None]
+            if not paired:
                 return []
-            best = max(candidates, key=lambda c: c.model_probability - (c.implied_probability or 0.0))
+            # Real market odds only exist for the 2.5 line (the CSV import's
+            # odds cascade never carries 1.5/3.5 lines) — falling back to a
+            # flat baseline for the other two made their "edge" equal to
+            # (roughly) their full raw probability against 2.5's genuine,
+            # much smaller market-based edge, so this always picked
+            # whichever line had the highest raw probability (Over 1.5,
+            # almost every time) — exactly the "collapses to the safest
+            # extreme" failure this edge-based mode was built to avoid.
+            # Each line's own real historical base rate (baseline_prob) is
+            # the correct fallback — Over 1.5 being true ~74% of the time
+            # regardless of the match means a ~75% model probability has
+            # almost no real edge, not a ~75% one.
+            best_spec, best = max(
+                paired,
+                key=lambda t: t[1].model_probability - (
+                    t[1].implied_probability if t[1].implied_probability is not None
+                    else t[0].get("baseline_prob", 0.5)
+                ),
+            )
             return [best]
 
         if mode == "independent_lines":
@@ -565,21 +603,26 @@ class Predictor:
 
     def _persist(self, results: list[PredictionResult]) -> None:
         """
-        Row-by-row, not one batch insert — predictions has a UNIQUE
-        constraint on (sport, fixture_id, market), but Corners legitimately
-        emits TWO rows under the same market ("Over_Under_Corners") for its
-        two lines (§1.3 — both lines are required, not a workaround). A
-        batch insert is atomic in Postgres: one duplicate-key row silently
-        kills every other valid row in the same call — confirmed live (7
-        valid predictions, 0 persisted, because 2 shared a market). Needs a
-        real migration (widen the constraint to include `selection`, which
-        already disambiguates the two lines) — see database/migrations/ —
-        this is the safe stopgap until that lands.
+        Row-by-row, not one batch upsert — predictions has a UNIQUE
+        constraint on (sport, fixture_id, market, selection), and Corners
+        legitimately emits TWO rows under the same market
+        ("Over_Under_Corners") for its two lines (§1.3 — both lines are
+        required, not a workaround); a batch call is atomic in Postgres, so
+        one bad row would silently kill every other valid row in the same
+        call. Uses upsert (not insert) on that same unique key so
+        re-running prediction generation after a model fix — e.g. excluding
+        a base model that turned out to saturate into a near-constant
+        output — actually overwrites the stale row instead of silently
+        failing with a duplicate-key error and leaving the old value in
+        place (confirmed live: re-running after the NN exclusion fix hit
+        exactly this with plain insert).
         """
         ok = 0
         for r in results:
             try:
-                self.client.table("predictions").insert(r.to_db_row()).execute()
+                self.client.table("predictions").upsert(
+                    r.to_db_row(), on_conflict="sport,fixture_id,market,selection"
+                ).execute()
                 ok += 1
             except Exception as exc:
                 logger.error("Failed to persist prediction %s/%s: %s", r.market, r.selection, exc)

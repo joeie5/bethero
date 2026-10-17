@@ -41,6 +41,7 @@ class AccumulatorModel {
   final double confidenceScore;
   final DateTime createdAt;
   final List<AccumulatorLegModel> legs;
+  final int? seasonWeek;
 
   AccumulatorModel({
     required this.id,
@@ -51,26 +52,28 @@ class AccumulatorModel {
     required this.confidenceScore,
     required this.createdAt,
     required this.legs,
+    this.seasonWeek,
   });
 
   factory AccumulatorModel.fromJson(Map<String, dynamic> json) {
     final legsList = json['legs'] as List<dynamic>? ?? [];
-    print('Parsing accumulator: ${json['acca_type']} '
+    print('Parsing accumulator: ${json['acc_type']} '
           'with ${legsList.length} legs');
-    
+
     return AccumulatorModel(
       id: json['id']?.toString() ?? '',
-      type: AccaType.fromString(json['acca_type'] ?? ''),
-      totalOdds: (json['total_odds'] as num?)?.toDouble() ?? 0.0,
-      status: AccaStatus.fromString(json['status'] ?? 'PENDING'),
+      type: AccaType.fromString(json['acc_type'] ?? ''),
+      totalOdds: (json['actual_odds'] as num?)?.toDouble() ?? 0.0,
+      status: AccaStatus.fromString(json['outcome'] ?? json['status'] ?? 'PENDING'),
       aiReasoning: json['ai_reasoning'] ?? '',
-      confidenceScore: (json['confidence_score'] as num?)?.toDouble() ?? 0.0,
+      confidenceScore: (json['model_win_probability'] as num?)?.toDouble() ?? 0.0,
       createdAt: json['created_at'] != null 
           ? DateTime.parse(json['created_at']) 
           : DateTime.now(),
       legs: legsList
           .map((l) => AccumulatorLegModel.fromJson(l as Map<String, dynamic>))
           .toList(),
+      seasonWeek: (json['season_week'] as num?)?.toInt(),
     );
   }
 }

@@ -1,243 +1,196 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
-import 'package:shimmer/shimmer.dart';
 import 'package:intl/intl.dart';
 import '../../../core/theme.dart';
+import '../../../data/mock/bethero_mock_data.dart';
 import '../../../data/models/fixture_model.dart';
-
 import '../../providers/fixture_provider.dart';
-import '../../widgets/fixtures/fixture_card.dart';
-import '../../widgets/fixtures/league_header.dart';
+import '../../widgets/common/sport_icon.dart';
+import '../../widgets/ui/ui_kit.dart';
 
+enum _SortKey { time, edge }
 
+/// Ports `pages/Fixtures.tsx` — header with fixture count, "By kickoff" /
+/// "Model picks first" sort toggle, fixtures grouped into collapsible
+/// LeagueSections, each row showing kickoff time, teams, best-market badge.
 class FixturesScreen extends ConsumerStatefulWidget {
-  const FixturesScreen({super.key});
+  final String? initialSport;
+  const FixturesScreen({super.key, this.initialSport});
 
   @override
   ConsumerState<FixturesScreen> createState() => _FixturesScreenState();
 }
 
 class _FixturesScreenState extends ConsumerState<FixturesScreen> {
-  DateTime _selectedDate = DateTime.now();
+  _SortKey _sort = _SortKey.time;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.initialSport != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        ref.read(selectedSportProvider.notifier).state = widget.initialSport!;
+      });
+    }
+  }
+
+  String _sportName(String id) {
+    final match = kMockSports.where((s) => s.id == id);
+    if (match.isNotEmpty) return match.first.name;
+    if (id.isEmpty) return 'Fixtures';
+    return id[0].toUpperCase() + id.substring(1);
+  }
 
   @override
   Widget build(BuildContext context) {
-    final fixturesAsync = ref.watch(fixturesBySportProvider(ref.watch(selectedSportProvider)));
     final selectedSport = ref.watch(selectedSportProvider);
-    final selectedDate = ref.watch(selectedDateProvider);
+    final fixturesAsync = ref.watch(fixturesBySportProvider(selectedSport));
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('FIXTURES'),
-        actions: [
-          IconButton(
-            onPressed: () => ref.invalidate(fixturesBySportProvider(selectedSport)),
-            icon: const Icon(Icons.refresh),
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          _buildDateSelector(selectedDate),
-          _buildSportFilters(),
-          Expanded(
-            child: RefreshIndicator(
-              onRefresh: () async => ref.invalidate(fixturesBySportProvider(selectedSport)),
-              child: fixturesAsync.when(
-                data: (fixtures) => _buildFixtureList(fixtures),
-                loading: () => _buildShimmerLoading(),
-                error: (e, _) => Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(Icons.sports_soccer, size: 64, color: Colors.grey[700]),
-                      const SizedBox(height: 16),
-                      const Text(
-                        "No fixtures available yet",
-                        style: TextStyle(color: Colors.grey),
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        "Live data coming soon",
-                        style: TextStyle(color: Colors.grey[600], fontSize: 12),
-                      ),
-                      const SizedBox(height: 24),
-                      OutlinedButton(
-                        onPressed: () => ref.refresh(fixturesBySportProvider(selectedSport)),
-                        child: const Text("Retry"),
-                      )
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildDateSelector(DateTime selectedDate) {
-    return Container(
-      height: 80,
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      color: AppTheme.cardBackground,
-      child: ListView.builder(
-        scrollDirection: Axis.horizontal,
-        itemCount: 7, // Future 7 days only
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        itemBuilder: (context, index) {
-          final date = DateTime.now().add(Duration(days: index));
-          final isSelected = DateFormat('yyyy-MM-dd').format(date) == DateFormat('yyyy-MM-dd').format(selectedDate);
-
-          return GestureDetector(
-            onTap: () => ref.read(selectedDateProvider.notifier).state = date,
-            child: Container(
-              width: 50,
-              margin: const EdgeInsets.symmetric(horizontal: 4),
-              decoration: BoxDecoration(
-                color: isSelected ? AppTheme.primaryGold : Colors.transparent,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Text(
-                    DateFormat('E').format(date).toUpperCase(),
-                    style: TextStyle(
-                      color: isSelected ? Colors.black : AppTheme.textSecondary,
-                      fontSize: 10,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    DateFormat('d').format(date),
-                    style: TextStyle(
-                      color: isSelected ? Colors.black : AppTheme.textPrimary,
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
-      ),
-    );
-  }
-
-  Widget _buildSportFilters() {
-    final sports = ['All', 'Football', 'Basketball', 'Tennis', 'NFL', 'Cricket', 'NHL', 'MLB'];
-    final selected = ref.watch(selectedSportProvider);
-
-    return Container(
-      height: 50,
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: ListView.builder(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 16),
-        itemCount: sports.length,
-        itemBuilder: (context, index) {
-          final sport = sports[index];
-          final isSelected = selected.toLowerCase() == sport.toLowerCase();
-          return Padding(
-            padding: const EdgeInsets.only(right: 8),
-            child: ChoiceChip(
-              label: Text(sport),
-              selected: isSelected,
-              onSelected: (val) => ref.read(selectedSportProvider.notifier).state = sport.toLowerCase(),
-              selectedColor: AppTheme.primaryGold,
-              backgroundColor: AppTheme.cardBackground,
-              labelStyle: TextStyle(color: isSelected ? Colors.black : AppTheme.textPrimary, fontSize: 12),
-            ),
-          );
-        },
-      ),
-    );
-  }
-
-  Widget _buildFixtureList(List<FixtureModel> fixtures) {
-    final selectedSport = ref.watch(selectedSportProvider);
-    // Filter by selected date (Note: Ideally API does this, but keeping it robust)
-    final filtered = fixtures.where((f) => DateFormat('yyy-MM-dd').format(f.matchDate) == DateFormat('yyy-MM-dd').format(ref.read(selectedDateProvider))).toList();
-
-    if (filtered.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(Icons.sports_soccer, size: 64, color: Colors.grey[700]),
-            const SizedBox(height: 16),
-            const Text(
-              "No fixtures available yet",
-              style: TextStyle(color: Colors.grey),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              "Live data coming soon",
-              style: TextStyle(color: Colors.grey[600], fontSize: 12),
-            ),
-            const SizedBox(height: 24),
-            OutlinedButton(
-              onPressed: () => ref.refresh(fixturesBySportProvider(selectedSport)),
-              child: const Text("Retry"),
-            )
-          ],
+      backgroundColor: AppColors.base,
+      appBar: ScreenHeader(title: _sportName(selectedSport), subtitle: fixturesAsync.maybeWhen(data: (f) => '${f.length} fixtures priced today', orElse: () => null)),
+      body: fixturesAsync.when(
+        data: (fixtures) => _buildBody(fixtures, selectedSport),
+        loading: () => const Padding(
+          padding: EdgeInsets.all(20),
+          child: Column(children: [SkeletonRow(), SizedBox(height: 12), SkeletonRow(), SizedBox(height: 12), SkeletonRow()]),
         ),
-      );
-    }
-
-    // Group by league
-    Map<String, List<FixtureModel>> grouped = {};
-    for (var f in filtered) {
-      final key = f.league;
-      if (!grouped.containsKey(key)) grouped[key] = [];
-      grouped[key]!.add(f);
-    }
-
-    return ListView.builder(
-      itemCount: grouped.length,
-      itemBuilder: (context, index) {
-        final league = grouped.keys.elementAt(index);
-        final leagueFixtures = grouped[league]!;
-        return Column(
-          children: [
-            LeagueGroupHeader(leagueName: league),
-            ...leagueFixtures.map((f) => FixtureCard(
-              fixture: f,
-              onTap: () => context.push('/fixture/${f.id}'),
-            )),
-          ],
-        );
-      },
+        error: (e, _) => EmptyState(
+          icon: Icons.schedule,
+          title: 'Fixtures coming soon',
+          body: '${_sportName(selectedSport)} fixtures for this date haven\'t been loaded yet. They\'re added automatically once the data source picks them up — check back soon.',
+          actionLabel: 'Browse other sports',
+          onAction: () => context.push('/sports'),
+        ),
+      ),
     );
   }
 
-  Widget _buildShimmerLoading() {
-    return Shimmer.fromColors(
-      baseColor: Colors.white12,
-      highlightColor: Colors.white24,
-      child: ListView.builder(
-        itemCount: 5,
-        itemBuilder: (_, __) => Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+  Widget _buildBody(List<FixtureModel> fixtures, String sport) {
+    final sorted = [...fixtures];
+    if (_sort == _SortKey.time) {
+      sorted.sort((a, b) => a.matchDate.compareTo(b.matchDate));
+    } else {
+      sorted.sort((a, b) => (b.predictions?.isNotEmpty == true ? 1 : 0) - (a.predictions?.isNotEmpty == true ? 1 : 0));
+    }
+    final grouped = <String, List<FixtureModel>>{};
+    for (final f in sorted) {
+      grouped.putIfAbsent(f.league, () => []).add(f);
+    }
+
+    return ListView(
+      padding: const EdgeInsets.only(bottom: 24),
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
+          child: Row(
             children: [
-              Container(width: 150, height: 20, color: Colors.white),
-              const SizedBox(height: 16),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Container(width: 100, height: 40, color: Colors.white),
-                  Container(width: 100, height: 40, color: Colors.white),
-                ],
-              ),
+              _SortChip(label: 'By kickoff', selected: _sort == _SortKey.time, onTap: () => setState(() => _sort = _SortKey.time)),
+              const SizedBox(width: 8),
+              _SortChip(label: 'Model picks first', selected: _sort == _SortKey.edge, onTap: () => setState(() => _sort = _SortKey.edge)),
             ],
           ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
+          child: fixtures.isEmpty
+              ? EmptyState(
+                  icon: Icons.schedule,
+                  title: 'Fixtures coming soon',
+                  body: '${_sportName(sport)} fixtures for this date haven\'t been loaded yet. They\'re added automatically once the data source picks them up — check back soon.',
+                  actionLabel: 'Browse other sports',
+                  onAction: () => context.push('/sports'),
+                )
+              : Column(
+                  children: grouped.entries.map((e) {
+                    return LeagueSection(
+                      league: e.key,
+                      count: e.value.length,
+                      child: Column(
+                        children: e.value.map((f) => _FixtureRow(fixture: f)).toList(),
+                      ),
+                    );
+                  }).toList(),
+                ),
+        ),
+        const ResponsibleFooter(),
+      ],
+    );
+  }
+}
+
+class _SortChip extends StatelessWidget {
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+  const _SortChip({required this.label, required this.selected, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        decoration: BoxDecoration(
+          color: selected ? AppColors.ink : Colors.white.withOpacity(0.04),
+          border: Border.all(color: selected ? Colors.transparent : Colors.white.withOpacity(0.1)),
+          borderRadius: BorderRadius.circular(999),
+        ),
+        child: Text(label,
+            style: TextStyle(
+                fontSize: 12, fontWeight: FontWeight.w600, color: selected ? AppColors.base : AppColors.inkMuted)),
+      ),
+    );
+  }
+}
+
+class _FixtureRow extends StatelessWidget {
+  final FixtureModel fixture;
+  const _FixtureRow({required this.fixture});
+
+  @override
+  Widget build(BuildContext context) {
+    final best = fixture.predictions != null && fixture.predictions!.isNotEmpty ? fixture.predictions!.first : null;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: GlassCard(
+        padding: const EdgeInsets.all(14),
+        onTap: () => context.push('/fixture/${fixture.id}'),
+        child: Row(
+          children: [
+            SizedBox(
+              width: 44,
+              child: Text(DateFormat('HH:mm').format(fixture.matchDate),
+                  style: AppTheme.numStyle(fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.inkMuted)),
+            ),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(fixture.homeTeam,
+                      maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: AppColors.ink)),
+                  Text(fixture.awayTeam,
+                      maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 14, color: AppColors.inkMuted)),
+                ],
+              ),
+            ),
+            if (best != null) ...[
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: AppColors.tier3.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(best.predictedOutcome,
+                    style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: AppColors.tier3)),
+              ),
+              const SizedBox(width: 8),
+            ] else
+              SportIcon(sportSlug: fixture.sport, size: 16, color: AppColors.inkFaint),
+            const SizedBox(width: 4),
+            const Icon(Icons.chevron_right, size: 16, color: AppColors.inkFaint),
+          ],
         ),
       ),
     );

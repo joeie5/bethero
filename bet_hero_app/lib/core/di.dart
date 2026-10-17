@@ -5,6 +5,8 @@ import '../data/repositories/accumulator_repository.dart';
 import '../data/repositories/fixture_repository.dart';
 import '../data/repositories/results_repository.dart';
 import '../data/repositories/user_repository.dart';
+import '../data/repositories/longshot_repository.dart';
+import '../data/repositories/tier_repository.dart';
 
 // Service Providers
 final authServiceProvider = Provider<AuthService>((ref) {
@@ -34,4 +36,14 @@ final resultsRepositoryProvider = Provider<ResultsRepository>((ref) {
 final userRepositoryProvider = Provider<UserRepository>((ref) {
   final api = ref.watch(apiServiceProvider);
   return UserRepository(api);
+});
+
+final longshotRepositoryProvider = Provider<LongshotRepository>((ref) {
+  final api = ref.watch(apiServiceProvider);
+  return LongshotRepository(api);
+});
+
+final tierRepositoryProvider = Provider<TierRepository>((ref) {
+  final api = ref.watch(apiServiceProvider);
+  return TierRepository(api);
 });

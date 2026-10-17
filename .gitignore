@@ -25,3 +25,12 @@ env/
 /vps_backtest_local/data/
 /vps_backtest_local/results_cache/
 /vps_backtest_local/__pycache__/
+
+# Model archives and compressed files
+*.tar.gz
+*.tar
+*.zip
+
+# Logs
+*.log
+/logs/

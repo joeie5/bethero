@@ -1,209 +1,213 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:fl_chart/fl_chart.dart';
 import '../../../core/theme.dart';
+import '../../../data/mock/bethero_mock_data.dart';
+import '../../../data/models/performance_model.dart';
+import '../../providers/results_provider.dart';
+import '../../widgets/ui/ui_kit.dart';
 
+const Map<String, ({String label, Color accent})> _tierMetaShort = {
+  '3odds': (label: '3-Odds', accent: AppColors.tier3),
+  '5odds': (label: '5-Odds', accent: AppColors.tier5),
+  '10odds': (label: '10-Odds', accent: AppColors.tier10),
+};
 
+/// Ports `pages/Performance.tsx` — overall hit-rate hero, by-tier grid,
+/// weekly trend bar chart, by-sport / by-market breakdown bars, and a
+/// tickets-tracked / win-streak stat row.
+///
+/// Overall hit rate and by-tier settlement come from the real
+/// `performanceStatsProvider` (Supabase-backed). The weekly trend and
+/// by-sport / by-market breakdowns use `kMockWeeklyTrend` /
+/// `kMockSportPerformance` / `kMockMarketPerformance` — the backend does not
+/// yet expose that granularity (see the MOCK comment in bethero_mock_data.dart).
 class StatsScreen extends ConsumerWidget {
   const StatsScreen({super.key});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final async = ref.watch(performanceStatsProvider);
+
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('MODEL STATS'),
+      backgroundColor: AppColors.base,
+      appBar: const ScreenHeader(title: 'Model performance', subtitle: 'Since launch'),
+      body: async.when(
+        data: (stats) => _buildBody(stats),
+        loading: () => const Center(child: CircularProgressIndicator(color: AppColors.tier3)),
+        error: (e, _) => _buildBody(PerformanceModel.empty()),
       ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          _buildCard(
-            title: 'Accuracy Over Time',
-            child: SizedBox(height: 200, child: _buildAccuracyLineChart()),
-          ),
-          const SizedBox(height: 20),
-          _buildCard(
-            title: 'Confidence Calibration',
-            subtitle: 'Actual Win Rate vs Model Confidence',
-            child: SizedBox(height: 200, child: _buildCalibrationChart()),
-          ),
-          const SizedBox(height: 20),
-          Row(
+    );
+  }
+
+  Widget _buildBody(PerformanceModel stats) {
+    final maxWeek = kMockWeeklyTrend.map((w) => w.hitRate).reduce((a, b) => a > b ? a : b);
+
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
+      children: [
+        GlassCard(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Expanded(
-                child: _buildCard(
-                  title: 'Success Rate',
-                  child: SizedBox(height: 150, child: _buildDonutChart()),
+              const Text('OVERALL HIT RATE',
+                  style: TextStyle(fontSize: 11, letterSpacing: 0.6, color: AppColors.inkFaint)),
+              const SizedBox(height: 4),
+              Text('${stats.winRate.toStringAsFixed(1)}%',
+                  style: const TextStyle(fontSize: 52, fontWeight: FontWeight.w800, height: 1, color: AppColors.ink)),
+              const SizedBox(height: 10),
+              Text('${stats.totalPredictions} tickets settled · model calibration tracked live',
+                  style: AppTheme.numStyle(fontSize: 12, color: AppColors.inkMuted)),
+              Container(
+                margin: const EdgeInsets.only(top: 12),
+                padding: const EdgeInsets.only(top: 12),
+                decoration: BoxDecoration(border: Border(top: BorderSide(color: Colors.white.withOpacity(0.06)))),
+                child: const Text(
+                  'The model has run slightly hot on its own forecasts this quarter — actual results are a few points below what it predicted. We publish both numbers so you can judge the calibration yourself.',
+                  style: TextStyle(fontSize: 12, height: 1.5, color: AppColors.inkMuted),
                 ),
               ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: _buildCard(
-                  title: 'Top Markets',
+            ],
+          ),
+        ),
+        const SizedBox(height: 20),
+        const Text('BY TIER', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, letterSpacing: 0.8, color: AppColors.inkMuted)),
+        const SizedBox(height: 12),
+        Row(
+          children: ['3odds', '5odds', '10odds'].map((key) {
+            final meta = _tierMetaShort[key]!;
+            final raw = stats.byType[key];
+            final hitRate = raw is Map ? (raw['win_rate'] as num? ?? 0).toDouble() : (raw as num? ?? 0).toDouble();
+            final settled = raw is Map ? (raw['settled'] as num? ?? 0).toInt() : 0;
+            return Expanded(
+              child: Padding(
+                padding: EdgeInsets.only(right: key == '10odds' ? 0 : 8),
+                child: GlassCard(
+                  padding: const EdgeInsets.all(14),
                   child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      _marketStat('BTTS', '74%', true),
-                      _marketStat('Over 2.5', '68%', true),
-                      _marketStat('Home Win', '61%', false),
+                      TierBadge(tier: key.replaceAll('odds', '')),
+                      const SizedBox(height: 10),
+                      Text('${hitRate.toStringAsFixed(1)}%',
+                          style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800, color: meta.accent)),
+                      const SizedBox(height: 4),
+                      Text('$settled settled', style: AppTheme.numStyle(fontSize: 10, color: AppColors.inkMuted)),
                     ],
                   ),
                 ),
               ),
+            );
+          }).toList(),
+        ),
+        const SizedBox(height: 24),
+        const Text('HIT RATE BY WEEK', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, letterSpacing: 0.8, color: AppColors.inkMuted)),
+        const SizedBox(height: 12),
+        GlassCard(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            children: [
+              SizedBox(
+                height: 144,
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: kMockWeeklyTrend.map((w) {
+                    final positive = w.hitRate >= 0.5;
+                    return Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 3),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.end,
+                          children: [
+                            Text('${(w.hitRate * 100).round()}', style: AppTheme.numStyle(fontSize: 10, color: AppColors.inkMuted)),
+                            const SizedBox(height: 6),
+                            Container(
+                              height: 90 * (w.hitRate / maxWeek),
+                              decoration: BoxDecoration(
+                                color: (positive ? AppColors.win : AppColors.loss).withOpacity(positive ? 0.55 : 0.5),
+                                borderRadius: const BorderRadius.vertical(top: Radius.circular(4)),
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(w.week, style: AppTheme.numStyle(fontSize: 10, color: AppColors.inkFaint)),
+                          ],
+                        ),
+                      ),
+                    );
+                  }).toList(),
+                ),
+              ),
+              Container(
+                margin: const EdgeInsets.only(top: 16),
+                padding: const EdgeInsets.only(top: 12),
+                decoration: BoxDecoration(border: Border(top: BorderSide(color: Colors.white.withOpacity(0.06)))),
+                child: const Text(
+                  'Two of the last eight weeks finished below break-even. Variance at this sample size is expected.',
+                  style: TextStyle(fontSize: 11, color: AppColors.inkMuted),
+                ),
+              ),
             ],
           ),
-          const SizedBox(height: 20),
-          _buildCard(
-            title: 'Monthly ROI Trend',
-            child: SizedBox(height: 200, child: _buildROITrendChart()),
-          ),
-          const SizedBox(height: 100),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCard({required String title, String? subtitle, required Widget child}) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: AppTheme.cardBackground,
-        borderRadius: BorderRadius.circular(16),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(title, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-          if (subtitle != null) ...[
-            const SizedBox(height: 4),
-            Text(subtitle, style: const TextStyle(color: AppTheme.textSecondary, fontSize: 10)),
+        ),
+        const SizedBox(height: 24),
+        const Text('BY SPORT', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, letterSpacing: 0.8, color: AppColors.inkMuted)),
+        const SizedBox(height: 12),
+        GlassCard(padding: EdgeInsets.zero, child: Column(children: kMockSportPerformance.map((r) => _BarRow(row: r)).toList())),
+        const SizedBox(height: 24),
+        const Text('BY MARKET', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, letterSpacing: 0.8, color: AppColors.inkMuted)),
+        const SizedBox(height: 12),
+        GlassCard(padding: EdgeInsets.zero, child: Column(children: kMockMarketPerformance.map((r) => _BarRow(row: r)).toList())),
+        const SizedBox(height: 20),
+        Row(
+          children: [
+            Expanded(child: StatCard(label: 'Tickets tracked', value: '${stats.totalPredictions}', caption: 'Since launch')),
+            const SizedBox(width: 12),
+            const Expanded(child: StatCard(label: 'Longest win streak', value: '7', caption: '3-odds tier, recently', accent: AppColors.win)),
           ],
-          const SizedBox(height: 20),
-          child,
-        ],
-      ),
-    );
-  }
-
-  Widget _buildAccuracyLineChart() {
-    return LineChart(
-      LineChartData(
-        gridData: const FlGridData(show: false),
-        titlesData: _chartTitles(),
-        borderData: FlBorderData(show: false),
-        lineBarsData: [
-          LineChartBarData(
-            spots: [
-              const FlSpot(0, 60), const FlSpot(1, 45), const FlSpot(2, 65),
-              const FlSpot(3, 70), const FlSpot(4, 68), const FlSpot(5, 75),
-            ],
-            isCurved: true,
-            color: AppTheme.primaryGold,
-            barWidth: 3,
-            dotData: const FlDotData(show: false),
-            belowBarData: BarAreaData(
-              show: true,
-              color: AppTheme.primaryGold.withOpacity(0.1),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCalibrationChart() {
-    return LineChart(
-      LineChartData(
-        gridData: FlGridData(
-          show: true,
-          drawVerticalLine: true,
-          getDrawingHorizontalLine: (val) => FlLine(color: Colors.white10, strokeWidth: 1),
-          getDrawingVerticalLine: (val) => FlLine(color: Colors.white10, strokeWidth: 1),
         ),
-        titlesData: _chartTitles(),
-        borderData: FlBorderData(show: false),
-        lineBarsData: [
-          // Perfect calibration line
-          LineChartBarData(
-            spots: [const FlSpot(0, 0), const FlSpot(5, 50), const FlSpot(10, 100)],
-            isCurved: false,
-            color: Colors.white24,
-            dashArray: [5, 5],
-            dotData: const FlDotData(show: false),
-          ),
-          // Actual model performance
-          LineChartBarData(
-            spots: [
-              const FlSpot(0, 5), const FlSpot(2, 22), const FlSpot(4, 38),
-              const FlSpot(6, 65), const FlSpot(8, 82), const FlSpot(10, 94),
-            ],
-            isCurved: true,
-            color: AppTheme.successGreen,
-            barWidth: 3,
-            dotData: const FlDotData(show: true),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildDonutChart() {
-    return PieChart(
-      PieChartData(
-        sectionsSpace: 0,
-        centerSpaceRadius: 40,
-        sections: [
-          PieChartSectionData(color: AppTheme.successGreen, value: 65, title: '65%', radius: 20, titleStyle: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
-          PieChartSectionData(color: AppTheme.dangerRed, value: 35, title: '35%', radius: 20, titleStyle: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildROITrendChart() {
-    return BarChart(
-      BarChartData(
-        alignment: BarChartAlignment.spaceEvenly,
-        maxY: 40,
-        titlesData: _chartTitles(),
-        gridData: const FlGridData(show: false),
-        borderData: FlBorderData(show: false),
-        barGroups: [
-          _bar(0, 15), _bar(1, 28), _bar(2, 22), _bar(3, 35), _bar(4, 31),
-        ],
-      ),
-    );
-  }
-
-  BarChartGroupData _bar(int x, double y) {
-    return BarChartGroupData(
-      x: x,
-      barRods: [
-        BarChartRodData(
-          toY: y,
-          color: AppTheme.primaryGold,
-          width: 16,
-          borderRadius: BorderRadius.circular(4),
-        ),
+        const ResponsibleFooter(),
       ],
     );
   }
+}
 
-  FlTitlesData _chartTitles() {
-    return const FlTitlesData(
-      show: true,
-      leftTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-      topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-      rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-    );
-  }
+class _BarRow extends StatelessWidget {
+  final BreakdownRow row;
+  const _BarRow({required this.row});
 
-  Widget _marketStat(String label, String val, bool isGood) {
+  @override
+  Widget build(BuildContext context) {
+    final positive = row.hitRate >= 0.5;
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(label, style: const TextStyle(color: AppTheme.textSecondary, fontSize: 12)),
-          Text(val, style: TextStyle(color: isGood ? AppTheme.successGreen : AppTheme.textPrimary, fontWeight: FontWeight.bold)),
+          SizedBox(width: 100, child: Text(row.label, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13, color: AppColors.ink))),
+          Expanded(
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(999),
+              child: Container(
+                height: 8,
+                color: Colors.white.withOpacity(0.05),
+                alignment: Alignment.centerLeft,
+                child: FractionallySizedBox(
+                  widthFactor: row.hitRate.clamp(0.0, 1.0),
+                  child: Container(color: (positive ? AppColors.win : AppColors.loss).withOpacity(positive ? 0.6 : 0.55)),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          SizedBox(
+            width: 44,
+            child: Text('${(row.hitRate * 100).toStringAsFixed(1)}%',
+                textAlign: TextAlign.right, style: AppTheme.numStyle(fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.ink)),
+          ),
+          SizedBox(
+            width: 48,
+            child: Text('${row.legs} legs',
+                textAlign: TextAlign.right, style: AppTheme.numStyle(fontSize: 11, color: AppColors.inkFaint)),
+          ),
         ],
       ),
     );

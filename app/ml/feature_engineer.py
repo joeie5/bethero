@@ -467,7 +467,11 @@ def compute_market_features(odds_rows: list[dict]) -> dict[str, float]:
     Parameters
     ----------
     odds_rows : List of fixture_odds rows for the match (one or more pulls,
-                possibly at different pulled_at timestamps, for the 1X2 market).
+                possibly at different pulled_at timestamps), across whichever
+                markets fixture_odds has for this fixture (1X2 and/or
+                Over_Under_Goals — the only two markets with real bookmaker
+                coverage; Corners/Cards/BTTS have none, confirmed against
+                the live fixture_odds table).
     """
     feats: dict[str, float] = {
         "market_implied_home": NAN_FILL,
@@ -479,51 +483,81 @@ def compute_market_features(odds_rows: list[dict]) -> dict[str, float]:
         "market_confidence":   NAN_FILL,
         "pinnacle_home_close": NAN_FILL,
         "pinnacle_away_close": NAN_FILL,
+        # Goals market (line 2.5 — the only line with real odds coverage):
+        # was computed post-hoc for edge-scoring one line's prediction only,
+        # never fed to the models as an input feature. The bookmaker's own
+        # total-goals view is a direct, strong signal for Goals/BTTS/Corners
+        # that team-form aggregates alone can't see — same treatment as the
+        # 1X2 block above, mirrored for this market.
+        "goals_market_implied_over":  NAN_FILL,
+        "goals_market_implied_under": NAN_FILL,
+        "goals_market_overround":     NAN_FILL,
+        "goals_odds_move_over":       NAN_FILL,
     }
     if not odds_rows:
         return feats
 
     one_x_two = [r for r in odds_rows if (r.get("market") or "") == "1X2"]
-    if not one_x_two:
-        return feats
+    if one_x_two:
+        # Prefer Pinnacle; fall back to any bookmaker
+        pinnacle_rows = [r for r in one_x_two if "pinnacle" in (r.get("bookmaker", "") or "").lower()]
+        rows = pinnacle_rows or one_x_two
+        rows_sorted = sorted(rows, key=lambda r: r.get("pulled_at") or "")
+        latest = rows_sorted[-1]
+        earliest = rows_sorted[0]
 
-    # Prefer Pinnacle; fall back to any bookmaker
-    pinnacle_rows = [r for r in one_x_two if "pinnacle" in (r.get("bookmaker", "") or "").lower()]
-    rows = pinnacle_rows or one_x_two
-    rows_sorted = sorted(rows, key=lambda r: r.get("pulled_at") or "")
-    latest = rows_sorted[-1]
-    earliest = rows_sorted[0]
+        close_h = latest.get("home_odds")
+        close_d = latest.get("draw_odds")
+        close_a = latest.get("away_odds")
 
-    close_h = latest.get("home_odds")
-    close_d = latest.get("draw_odds")
-    close_a = latest.get("away_odds")
+        if close_h and close_a:
+            implied_h = _safe_div(1.0, float(close_h))
+            implied_d = _safe_div(1.0, float(close_d)) if close_d else 0.0
+            implied_a = _safe_div(1.0, float(close_a))
+            overround = implied_h + implied_d + implied_a
 
-    if close_h and close_a:
-        implied_h = _safe_div(1.0, float(close_h))
-        implied_d = _safe_div(1.0, float(close_d)) if close_d else 0.0
-        implied_a = _safe_div(1.0, float(close_a))
-        overround = implied_h + implied_d + implied_a
+            feats["market_overround"]    = round(overround, 4)
+            feats["market_implied_home"] = round(_safe_div(implied_h, overround), 4)
+            feats["market_implied_draw"] = round(_safe_div(implied_d, overround), 4)
+            feats["market_implied_away"] = round(_safe_div(implied_a, overround), 4)
 
-        feats["market_overround"]    = round(overround, 4)
-        feats["market_implied_home"] = round(_safe_div(implied_h, overround), 4)
-        feats["market_implied_draw"] = round(_safe_div(implied_d, overround), 4)
-        feats["market_implied_away"] = round(_safe_div(implied_a, overround), 4)
+            if pinnacle_rows:
+                feats["pinnacle_home_close"] = float(close_h)
+                feats["pinnacle_away_close"] = float(close_a)
 
-        if pinnacle_rows:
-            feats["pinnacle_home_close"] = float(close_h)
-            feats["pinnacle_away_close"] = float(close_a)
+        # Odds movement: earliest pull vs latest pull (proxy for open/close
+        # since fixture_odds has no explicit opening/closing columns, only
+        # pulled_at)
+        open_h = earliest.get("home_odds")
+        open_a = earliest.get("away_odds")
+        if open_h and close_h:
+            feats["odds_move_home"] = round(float(open_h) - float(close_h), 4)
+        if open_a and close_a:
+            feats["odds_move_away"] = round(float(open_a) - float(close_a), 4)
 
-    # Odds movement: earliest pull vs latest pull (proxy for open/close since
-    # fixture_odds has no explicit opening/closing columns, only pulled_at)
-    open_h = earliest.get("home_odds")
-    open_a = earliest.get("away_odds")
-    if open_h and close_h:
-        feats["odds_move_home"] = round(float(open_h) - float(close_h), 4)
-    if open_a and close_a:
-        feats["odds_move_away"] = round(float(open_a) - float(close_a), 4)
+        total_move = abs(feats["odds_move_home"] if feats["odds_move_home"] != NAN_FILL else 0.0) \
+                   + abs(feats["odds_move_away"] if feats["odds_move_away"] != NAN_FILL else 0.0)
+        feats["market_confidence"] = round(min(1.0, total_move / 1.0), 4)
 
-    total_move = abs(feats["odds_move_home"]) + abs(feats["odds_move_away"])
-    feats["market_confidence"] = round(min(1.0, total_move / 1.0), 4)
+    goals = [r for r in odds_rows if (r.get("market") or "") == "Over_Under_Goals"]
+    if goals:
+        rows_sorted = sorted(goals, key=lambda r: r.get("pulled_at") or "")
+        latest = rows_sorted[-1]
+        earliest = rows_sorted[0]
+
+        close_over  = latest.get("over_odds")
+        close_under = latest.get("under_odds")
+        if close_over and close_under:
+            implied_over  = _safe_div(1.0, float(close_over))
+            implied_under = _safe_div(1.0, float(close_under))
+            overround = implied_over + implied_under
+            feats["goals_market_overround"]     = round(overround, 4)
+            feats["goals_market_implied_over"]  = round(_safe_div(implied_over, overround), 4)
+            feats["goals_market_implied_under"] = round(_safe_div(implied_under, overround), 4)
+
+        open_over = earliest.get("over_odds")
+        if open_over and close_over:
+            feats["goals_odds_move_over"] = round(float(open_over) - float(close_over), 4)
 
     return feats
 

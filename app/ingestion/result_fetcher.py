@@ -55,6 +55,10 @@ API_SPORTS_SPORT_MAP: dict[str, str] = {
 }
 
 
+class QuotaExhausted(Exception):
+    """API-Sports' daily request quota is spent."""
+
+
 def _api_retry(fn):
     return retry(
         stop=stop_after_attempt(3),
@@ -85,7 +89,14 @@ class ResultAPIClient:
         base  = f"https://v3.{sport}.api-sports.io"
         resp  = self._http.get(f"{base}/fixtures", params={"id": fixture_id})
         resp.raise_for_status()
-        items = resp.json().get("response", [])
+        body = resp.json()
+        # API-Sports reports an exhausted daily quota as HTTP 200 with an
+        # `errors` body (confirmed live on /fixtures/statistics), not always
+        # a 429 — without this the caller reads it as "no result" and keeps
+        # spending a request per prediction against a spent quota.
+        if isinstance(body.get("errors"), dict) and "requests" in body["errors"]:
+            raise QuotaExhausted(body["errors"]["requests"])
+        items = body.get("response", [])
         return items[0] if items else None
 
     def close(self):
@@ -104,8 +115,13 @@ class OutcomeResolver:
     """
 
     @staticmethod
-    def resolve(db_market: str, selection: str, result: dict) -> bool:
-        """Returns True (correct) / False (incorrect). `result` is a
+    def resolve(db_market: str, selection: str, result: dict) -> bool | None:
+        """Returns True (correct) / False (incorrect) / None (can't tell —
+        the result source doesn't carry this stat, e.g. a goals-only feed
+        like API-Sports's basic fixture result or The Odds API's /scores
+        endpoint has no corner/card counts). Callers must leave a None
+        prediction unresolved rather than writing it as incorrect — a
+        missing stat is not evidence the pick lost. `result` is a
         match_results row: home_goals, away_goals, btts, total_corners,
         total_cards, ftr."""
         market = (db_market or "").strip()
@@ -137,21 +153,22 @@ class OutcomeResolver:
             if market == "Over_Under_Corners":
                 total_corners = result.get("total_corners")
                 if total_corners is None:
-                    return False
+                    return None
                 direction, line = sel.split()
                 return total_corners > float(line) if direction == "OVER" else total_corners < float(line)
 
             if market == "Cards":
                 total_cards = result.get("total_cards")
                 if total_cards is None:
-                    return False
+                    return None
                 direction, line = sel.split()
                 return total_cards > float(line) if direction == "OVER" else total_cards < float(line)
 
         except Exception as exc:
             logger.warning("Outcome resolve error (market=%s, sel=%s): %s", market, selection, exc)
+            return None
 
-        return False
+        return None
 
 
 # ─────────────────────────── Result Fetcher ────────────────────────────────
@@ -162,6 +179,15 @@ class ResultFetcher:
         self.supabase = get_supabase_admin()
         self.api      = ResultAPIClient()
         self._new_resolutions = 0
+        # Set once API-Sports answers 429 (daily quota spent). From then on
+        # this run only settles predictions whose result is already cached
+        # in match_results — before this, every remaining fixture burned
+        # 3 retries against a maxed-out quota, so the job crawled through
+        # the backlog and never reached the predictions that needed no API
+        # call at all (confirmed live: 223 Sep 18 predictions had a cached
+        # result but stayed unsettled).
+        self._api_exhausted = False
+        self._marked_ft: set[tuple[str, str]] = set()
 
     def run(self) -> None:
         logger.info("🔍 ResultFetcher starting — %s UTC", datetime.now(timezone.utc).isoformat())
@@ -199,25 +225,47 @@ class ResultFetcher:
         from datetime import date as _date
         today = _date.today().isoformat()
 
-        pred_res = (
-            self.supabase.table("predictions")
-            .select("id, sport, fixture_id, market, selection")
-            .is_("is_correct", "null")
-            .execute()
-        )
-        preds = pred_res.data or []
+        # PostgREST caps a response at 1000 rows by default, and this table
+        # can easily hold 3000+ unsettled rows — confirmed live. An
+        # unordered .range() also gives an unstable row set between calls
+        # (Postgres makes no ordering guarantee without one), so both the
+        # pagination and the explicit .order() below are required, not
+        # just the pagination alone (see app/routers/tiers.py's
+        # _day_calendar for the same bug pattern found and fixed there).
+        preds: list[dict] = []
+        start = 0
+        PAGE = 1000
+        while True:
+            pred_res = (
+                self.supabase.table("predictions")
+                .select("id, sport, fixture_id, market, selection")
+                .is_("is_correct", "null")
+                .order("id")
+                .range(start, start + PAGE - 1)
+                .execute()
+            )
+            page = pred_res.data or []
+            preds.extend(page)
+            if len(page) < PAGE:
+                break
+            start += PAGE
         if not preds:
             return []
 
         pairs = {(p["sport"], p["fixture_id"]) for p in preds}
-        fx_res = (
-            self.supabase.table("fixtures")
-            .select("sport, fixture_id, match_date, status")
-            .in_("fixture_id", [fid for _, fid in pairs])
-            .or_(f"status.eq.FT,match_date.lt.{today}")
-            .execute()
-        )
-        due_keys = {(r["sport"], r["fixture_id"]) for r in (fx_res.data or [])}
+        fixture_ids = [fid for _, fid in pairs]
+        fx_rows: list[dict] = []
+        for i in range(0, len(fixture_ids), 500):
+            chunk = fixture_ids[i:i + 500]
+            fx_res = (
+                self.supabase.table("fixtures")
+                .select("sport, fixture_id, match_date, status")
+                .in_("fixture_id", chunk)
+                .or_(f"status.eq.FT,match_date.lt.{today}")
+                .execute()
+            )
+            fx_rows.extend(fx_res.data or [])
+        due_keys = {(r["sport"], r["fixture_id"]) for r in fx_rows}
 
         return [p for p in preds if (p["sport"], p["fixture_id"]) in due_keys]
 
@@ -231,7 +279,24 @@ class ResultFetcher:
             logger.debug("No result yet for %s/%s", sport, fixture_id)
             return
 
+        # A stored result means the match is over — fixtures.status is only
+        # ever set at ingestion, so without this a played match stays NS/LIVE
+        # forever (confirmed live: 105 of Sep 18's fixtures).
+        if (sport, fixture_id) not in self._marked_ft:
+            self.supabase.table("fixtures").update({"status": "FT"}) \
+                .eq("sport", sport).eq("fixture_id", fixture_id).execute()
+            self._marked_ft.add((sport, fixture_id))
+
         is_correct = OutcomeResolver.resolve(pred["market"], pred["selection"], result)
+        if is_correct is None:
+            # Result source doesn't carry the stat this market needs (e.g. a
+            # goals-only feed for a Corners/Cards pick) — leave unresolved
+            # rather than writing a false verdict; a later source with the
+            # full stat line can still settle it properly.
+            logger.debug("Cannot resolve prediction %s (market=%s) — source missing required stat",
+                         pred["id"], pred["market"])
+            return
+
         actual_outcome = {"H": "Home", "D": "Draw", "A": "Away"}.get(result.get("ftr"), result.get("ftr"))
 
         self.supabase.table("predictions").update({
@@ -318,7 +383,20 @@ class ResultFetcher:
         if rows and rows[0].get("home_goals") is not None:
             return rows[0]
 
-        api_result = self.api.get_fixture(sport, fixture_id)
+        if self._api_exhausted:
+            return None
+        try:
+            api_result = self.api.get_fixture(sport, fixture_id)
+        except QuotaExhausted:
+            logger.warning("API-Sports daily quota exhausted — settling from cached results only for the rest of this run")
+            self._api_exhausted = True
+            return None
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                logger.warning("API-Sports rate-limited (429) — settling from cached results only for the rest of this run")
+                self._api_exhausted = True
+                return None
+            raise
         if not api_result:
             return None
 

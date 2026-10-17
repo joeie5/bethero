@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
-import 'package:lottie/lottie.dart';
 import '../providers/auth_provider.dart';
 import '../../core/theme.dart';
+import '../widgets/ui/ui_kit.dart';
 
+/// Ports `pages/Splash.tsx` — centered logo mark + wordmark, fade/scale in,
+/// auto-navigates after a short delay.
 class SplashScreen extends ConsumerStatefulWidget {
   const SplashScreen({super.key});
 
@@ -12,22 +14,26 @@ class SplashScreen extends ConsumerStatefulWidget {
   ConsumerState<SplashScreen> createState() => _SplashScreenState();
 }
 
-class _SplashScreenState extends ConsumerState<SplashScreen> {
+class _SplashScreenState extends ConsumerState<SplashScreen> with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  late final Animation<double> _opacity;
+  late final Animation<double> _scale;
+
   @override
   void initState() {
     super.initState();
+    _controller = AnimationController(vsync: this, duration: const Duration(milliseconds: 300));
+    _opacity = CurvedAnimation(parent: _controller, curve: Curves.easeOut);
+    _scale = Tween<double>(begin: 0.96, end: 1.0).animate(CurvedAnimation(parent: _controller, curve: Curves.easeOut));
+    _controller.forward();
     _handleNavigation();
   }
 
   Future<void> _handleNavigation() async {
-    // Wait for the pulse animation/minimum splash time
-    await Future.delayed(const Duration(milliseconds: 2500));
-    
+    await Future.delayed(const Duration(milliseconds: 1700));
     if (!mounted) return;
 
-    final authState = ref.read(authStateProvider).value;
     final user = ref.read(currentUserProvider);
-
     if (user != null) {
       context.go('/home');
     } else {
@@ -36,56 +42,29 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
   }
 
   @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Container(
-        width: double.infinity,
-        decoration: const BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topCenter,
-            end: Alignment.bottomCenter,
-            colors: [AppTheme.background, AppTheme.secondaryBackground],
+      backgroundColor: AppColors.baseDeep,
+      body: Center(
+        child: FadeTransition(
+          opacity: _opacity,
+          child: ScaleTransition(
+            scale: _scale,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: const [
+                LogoMark(size: 64),
+                SizedBox(height: 16),
+                Wordmark(fontSize: 30),
+              ],
+            ),
           ),
-        ),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            // Placeholder for Lottie pulse animation
-            // In a real app, you'd add the .json asset to assets/animations/
-            Hero(
-              tag: 'logo',
-              child: Container(
-                width: 120,
-                height: 120,
-                decoration: BoxDecoration(
-                  color: AppTheme.primaryGold.withOpacity(0.1),
-                  shape: BoxShape.circle,
-                ),
-                child: const Icon(
-                  Icons.auto_graph,
-                  color: AppTheme.primaryGold,
-                  size: 60,
-                ),
-              ),
-            ),
-            const SizedBox(height: 24),
-            Text(
-              'BET HERO',
-              style: Theme.of(context).textTheme.displaySmall?.copyWith(
-                    letterSpacing: 4,
-                    color: AppTheme.primaryGold,
-                  ),
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              'AI PREDICTIONS',
-              style: TextStyle(
-                color: AppTheme.textSecondary,
-                letterSpacing: 2,
-                fontSize: 12,
-              ),
-            ),
-          ],
         ),
       ),
     );
