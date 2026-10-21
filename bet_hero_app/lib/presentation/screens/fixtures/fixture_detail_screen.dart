@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
 import '../../../core/theme.dart';
 import '../../../data/models/prediction_model.dart';
+import '../../../data/models/match_stats_model.dart';
 import '../../providers/fixture_provider.dart';
 import '../../widgets/common/sport_icon.dart';
 import '../../widgets/ui/ui_kit.dart';
@@ -20,6 +21,7 @@ class FixtureDetailScreen extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final fixtureAsync = ref.watch(fixtureDetailProvider(id));
+    final statsAsync = ref.watch(matchStatsProvider(id));
 
     return Scaffold(
       backgroundColor: AppColors.base,
@@ -84,6 +86,12 @@ class FixtureDetailScreen extends ConsumerWidget {
                           ),
                         ],
                       ),
+                    ),
+                    const SizedBox(height: 20),
+                    statsAsync.when(
+                      loading: () => const SizedBox.shrink(),
+                      error: (e, _) => const SizedBox.shrink(),
+                      data: (stats) => _MatchStatsSection(stats: stats),
                     ),
                     if (selected != null) ...[
                       const SizedBox(height: 20),
@@ -258,6 +266,125 @@ class _MarketRow extends StatelessWidget {
               textAlign: TextAlign.right,
               style: AppTheme.numStyle(fontSize: 12, fontWeight: FontWeight.w600, color: edgePositive ? AppColors.win : AppColors.loss),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Score header + the per-stat home-vs-away bar comparison (shots,
+/// possession, fouls, cards, xG — whatever API-Sports' statistics endpoint
+/// actually has for this fixture). Renders nothing for a fixture with no
+/// stats data rather than a fake/empty-looking chart.
+class _MatchStatsSection extends StatelessWidget {
+  final MatchStatsModel? stats;
+  const _MatchStatsSection({required this.stats});
+
+  @override
+  Widget build(BuildContext context) {
+    final s = stats;
+    if (s == null) return const SizedBox.shrink();
+
+    final isFinished = s.status == 'FT' || s.status == 'finished';
+    final hasScore = s.homeGoals != null && s.awayGoals != null;
+
+    if (!s.statsAvailable || s.stats.isEmpty) {
+      if (!isFinished) return const SizedBox.shrink();
+      return Padding(
+        padding: const EdgeInsets.only(top: 4, bottom: 4),
+        child: Text(
+          'Match stats not available for this fixture.',
+          style: TextStyle(fontSize: 12, color: AppColors.inkFaint),
+        ),
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (hasScore)
+          GlassCard(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Expanded(child: Text(s.homeTeam ?? '', textAlign: TextAlign.right, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.ink))),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                      child: Text('${s.homeGoals} - ${s.awayGoals}', style: AppTheme.numStyle(fontSize: 22, fontWeight: FontWeight.w800, color: AppColors.ink)),
+                    ),
+                    Expanded(child: Text(s.awayTeam ?? '', textAlign: TextAlign.left, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: AppColors.ink))),
+                  ],
+                ),
+                if (isFinished) ...[
+                  const SizedBox(height: 4),
+                  const Text('Full Time', style: TextStyle(fontSize: 11, color: AppColors.inkFaint)),
+                ],
+              ],
+            ),
+          ),
+        const SizedBox(height: 16),
+        const Text('MATCH STATS', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, letterSpacing: 0.6, color: AppColors.inkMuted)),
+        const SizedBox(height: 10),
+        GlassCard(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          child: Column(
+            children: [
+              for (var i = 0; i < s.stats.length; i++) ...[
+                if (i > 0) const Divider(height: 1, color: Colors.white12),
+                _StatComparisonRow(row: s.stats[i]),
+              ],
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _StatComparisonRow extends StatelessWidget {
+  final StatRow row;
+  const _StatComparisonRow({required this.row});
+
+  @override
+  Widget build(BuildContext context) {
+    final home = (row.home ?? 0).toDouble();
+    final away = (row.away ?? 0).toDouble();
+    final total = home + away;
+    final homeFraction = total > 0 ? home / total : 0.5;
+    final awayFraction = total > 0 ? away / total : 0.5;
+
+    String fmt(num? v) => v == null ? '—' : (v == v.roundToDouble() ? v.toInt().toString() : v.toString());
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              SizedBox(width: 44, child: Text(fmt(row.home), style: AppTheme.numStyle(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.ink))),
+              Expanded(
+                child: Text(row.label, textAlign: TextAlign.center, style: const TextStyle(fontSize: 11, color: AppColors.inkFaint)),
+              ),
+              SizedBox(width: 44, child: Text(fmt(row.away), textAlign: TextAlign.right, style: AppTheme.numStyle(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.ink))),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Expanded(
+                flex: (homeFraction * 1000).round().clamp(1, 1000),
+                child: Container(height: 5, decoration: BoxDecoration(color: AppColors.gold, borderRadius: const BorderRadius.horizontal(left: Radius.circular(3)))),
+              ),
+              const SizedBox(width: 2),
+              Expanded(
+                flex: (awayFraction * 1000).round().clamp(1, 1000),
+                child: Container(height: 5, decoration: BoxDecoration(color: Colors.white.withOpacity(0.18), borderRadius: const BorderRadius.horizontal(right: Radius.circular(3)))),
+              ),
+            ],
           ),
         ],
       ),

@@ -2,6 +2,7 @@ import 'package:dio/dio.dart';
 import 'package:intl/intl.dart';
 
 import '../models/fixture_model.dart';
+import '../models/match_stats_model.dart';
 import '../../services/api_service.dart';
 
 class FixtureRepository {
@@ -106,6 +107,18 @@ class FixtureRepository {
       return data;
     } catch (e) {
       return [];
+    }
+  }
+
+  Future<MatchStatsModel?> getMatchStats(String id, {String sport = 'football'}) async {
+    try {
+      final response = await _api.dio.get('/predictions/match/$id/stats', queryParameters: {'sport': sport});
+      return MatchStatsModel.fromJson(response.data as Map<String, dynamic>);
+    } on DioException catch (e) {
+      if (e.response?.statusCode == 404) return null;
+      rethrow;
+    } catch (e) {
+      return null;
     }
   }
 }

@@ -35,8 +35,13 @@ class PredictionModel {
 
   factory PredictionModel.fromJson(Map<String, dynamic> json) {
     return PredictionModel(
-      id: json['id'],
-      matchId: json['match_id'],
+      id: json['id'] ?? 0,
+      // predictions.match_id doesn't exist either (the table uses
+      // fixture_id, a string, not an int match_id) — same unconditional
+      // null->non-nullable-int crash as created_at above. Unused anywhere
+      // in the UI (only the separate AccumulatorLegModel.matchId is), so a
+      // 0 fallback has no functional effect.
+      matchId: json['match_id'] ?? 0,
       market: json['market'] ?? '',
       predictedOutcome: json['predicted_outcome'] ?? '',
       modelProbability: (json['model_probability'] as num? ?? 0.0).toDouble(),
@@ -48,10 +53,16 @@ class PredictionModel {
       actualOutcome: json['actual_outcome'],
       result: json['result'] ?? json['actual_outcome'],
       aiReasoning: json['ai_reasoning'],
-      matchDate: json['match_date'] != null 
-          ? DateTime.parse(json['match_date']) 
+      matchDate: json['match_date'] != null
+          ? DateTime.parse(json['match_date'])
           : DateTime.now(), // Fallback to now if missing
-      createdAt: DateTime.parse(json['created_at']),
+      // predictions.created_at doesn't exist (the table only has
+      // generated_at) — DateTime.parse(null) threw unconditionally for
+      // every prediction, which silently failed the whole fixture parse
+      // and sent every match detail tap to the "Not available" screen.
+      createdAt: json['created_at'] != null
+          ? DateTime.parse(json['created_at'])
+          : (json['generated_at'] != null ? DateTime.parse(json['generated_at']) : DateTime.now()),
     );
   }
 }

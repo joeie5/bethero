@@ -8,6 +8,9 @@ import logging
 from typing import List, Optional
 from datetime import datetime, timezone
 
+import os
+
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from app.database import get_supabase_admin
 from app.schemas.schemas import PredictionOut, AccumulatorOut, MatchOut
@@ -340,3 +343,141 @@ async def get_match_prediction(fixture_id: str, sport: str = "football"):
     except Exception as exc:
         logger.error("Error fetching match data for %s/%s: %s", sport, fixture_id, exc)
         raise HTTPException(status_code=500, detail="Failed to fetch match data.")
+
+
+# Display order/labels for the match-stats UI — only fields API-Sports'
+# free-tier /fixtures/statistics endpoint actually returns (confirmed live
+# 2026-10-21). Throw-ins/Crosses/Goal kicks are NOT in that response, so
+# they're deliberately left out rather than faked.
+_STAT_DISPLAY = [
+    ("expected_goals", "Expected goals (xG)", "decimal"),
+    ("Shots on Goal", "Shots on target", "int"),
+    ("Shots off Goal", "Shots off target", "int"),
+    ("Blocked Shots", "Blocked Shots", "int"),
+    ("Ball Possession", "Possession (%)", "percent"),
+    ("Corner Kicks", "Corner Kicks", "int"),
+    ("Offsides", "Offsides", "int"),
+    ("Fouls", "Fouls", "int"),
+    ("Yellow Cards", "Yellow Cards", "int"),
+    ("Goalkeeper Saves", "Goalkeeper Saves", "int"),
+    ("Passes %", "Pass accuracy (%)", "percent"),
+]
+
+
+def _parse_stat_value(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, str) and raw.endswith("%"):
+        raw = raw[:-1]
+    try:
+        f = float(raw)
+        return int(f) if f.is_integer() else f
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_stats_rows(raw_stats: list) -> list[dict]:
+    """raw_stats is API-Sports' /fixtures/statistics `response` array: one
+    entry per team, each with its own `statistics` list of {type, value}."""
+    if not raw_stats or len(raw_stats) < 2:
+        return []
+    by_team = [
+        {s["type"]: s.get("value") for s in (team.get("statistics") or [])}
+        for team in raw_stats[:2]
+    ]
+    rows = []
+    for api_key, label, _kind in _STAT_DISPLAY:
+        home_val = _parse_stat_value(by_team[0].get(api_key))
+        away_val = _parse_stat_value(by_team[1].get(api_key))
+        if home_val is None and away_val is None:
+            continue
+        rows.append({"label": label, "home": home_val, "away": away_val})
+    return rows
+
+
+@router.get("/match/{fixture_id}/stats")
+async def get_match_stats(fixture_id: str, sport: str = "football"):
+    """Full match-stats comparison (shots, possession, fouls, cards, xG,
+    etc.) for the match-detail "Stats" view. API-Sports' statistics
+    endpoint is quota-limited, so the raw response is fetched once and
+    cached in match_results.raw_stats — every later view is a DB read, not
+    a fresh API call.
+
+    Only ever available for fixtures API-Sports itself knows about
+    (provider == 'api-sports', a real numeric fixture_id) — fixtures
+    inserted from the football-data.co.uk backfill (provider ==
+    'football-data', synthetic 'fd-...' ids) have no matching API-Sports
+    fixture to query, same reason their Corners/Cards markets can't settle
+    either. Reported as stats_available=false rather than erroring."""
+    supabase = get_supabase_admin()
+
+    fx_res = (
+        supabase.table("fixtures").select("*")
+        .eq("sport", sport).eq("fixture_id", fixture_id)
+        .maybe_single().execute()
+    )
+    if not fx_res or not fx_res.data:
+        raise HTTPException(status_code=404, detail="Match not found.")
+    fixture = fx_res.data
+
+    mr_res = (
+        supabase.table("match_results").select("*")
+        .eq("sport", sport).eq("fixture_id", fixture_id)
+        .maybe_single().execute()
+    )
+    match_result = mr_res.data if mr_res else None
+
+    header = {
+        "fixture_id": fixture_id,
+        "home_team": fixture.get("home_team"),
+        "away_team": fixture.get("away_team"),
+        "home_team_logo": fixture.get("home_team_logo"),
+        "away_team_logo": fixture.get("away_team_logo"),
+        "status": fixture.get("status"),
+        "home_goals": match_result.get("home_goals") if match_result else None,
+        "away_goals": match_result.get("away_goals") if match_result else None,
+    }
+
+    if match_result and match_result.get("raw_stats"):
+        return {**header, "stats_available": True, "stats": _build_stats_rows(match_result["raw_stats"])}
+
+    can_query_api_sports = (
+        fixture.get("provider") == "api-sports"
+        and fixture.get("status") == "FT"
+        and str(fixture_id).isdigit()
+    )
+    if not can_query_api_sports:
+        return {**header, "stats_available": False, "stats": []}
+
+    api_key = os.getenv("API_SPORTS_KEY", "")
+    if not api_key:
+        return {**header, "stats_available": False, "stats": []}
+
+    try:
+        resp = httpx.get(
+            "https://v3.football.api-sports.io/fixtures/statistics",
+            headers={"x-apisports-key": api_key},
+            params={"fixture": fixture_id},
+            timeout=20,
+        )
+        data = resp.json()
+    except httpx.HTTPError as exc:
+        logger.warning("API-Sports statistics request failed for %s: %s", fixture_id, exc)
+        return {**header, "stats_available": False, "stats": []}
+
+    raw_stats = data.get("response") or []
+    if not raw_stats:
+        return {**header, "stats_available": False, "stats": []}
+
+    try:
+        if match_result:
+            supabase.table("match_results").update({"raw_stats": raw_stats}).eq("sport", sport).eq("fixture_id", fixture_id).execute()
+        else:
+            supabase.table("match_results").upsert(
+                {"sport": sport, "fixture_id": fixture_id, "raw_stats": raw_stats},
+                on_conflict="sport,fixture_id",
+            ).execute()
+    except Exception as exc:
+        logger.warning("Failed to cache raw_stats for %s: %s", fixture_id, exc)
+
+    return {**header, "stats_available": True, "stats": _build_stats_rows(raw_stats)}
