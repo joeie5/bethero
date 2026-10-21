@@ -47,7 +47,7 @@ import pandas as pd
 
 from app.ml.feature_engineer import FeatureEngineer
 from app.ml.models import StackingEnsemble, MODEL_DIR
-from app.ml.league_tiers import LEAGUE_TIERS
+from app.ml.league_tiers import LEAGUE_TIERS, MAIN_TIER_LEAGUE_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +321,12 @@ class Predictor:
             spec = MARKET_SPEC.get(market)
             if not spec:
                 logger.warning("Unknown market %r — skipping", market)
+                continue
+            # Corners predictions on Extra-tier leagues are degenerate — see
+            # MAIN_TIER_LEAGUE_KEYS' docstring. league_key is None for sports
+            # without a trained-league whitelist (anything but football
+            # right now), so this only ever restricts football.
+            if market == "Over_Under_Corners" and league_key is not None and league_key not in MAIN_TIER_LEAGUE_KEYS:
                 continue
             try:
                 results.extend(

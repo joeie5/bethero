@@ -78,6 +78,27 @@ LEAGUE_NAMES: dict[str, str] = {
 }
 
 
+# The 22 "Main tier" league_keys (CLAUDE.md §5) sourced from football-data
+# .co.uk's per-season-per-division files, which include real corner-kick
+# (HC/AC) and card (HY/AY/HR/AR) columns. The 16 "Extra tier" leagues' single
+# combined-file source has NEITHER — confirmed live (2026-10-21) by
+# inspecting its actual CSV schema (Country,League,Season,Date,Time,Home,
+# Away,HG,AG,Res + odds only). The Corners model trained almost entirely on
+# Main-tier data as a result, and produces degenerate, uncalibrated
+# probabilities on Extra-tier fixtures (confirmed live same day: ~18-21%
+# predicted vs ~70%+ everywhere else, on a handful of samples) — not a
+# legitimate prediction, just the model extrapolating outside what it was
+# ever trained on. Used to suppress Corners (and, by the same reasoning,
+# would apply to Cards) predictions for the 16 Extra-tier leagues until a
+# tier-stratified retrain gives them real signal.
+MAIN_TIER_LEAGUE_KEYS: frozenset[str] = frozenset({
+    "E0", "E1", "E2", "E3", "EC",
+    "SC0", "SC1", "SC2", "SC3",
+    "D1", "D2", "SP1", "SP2", "I1", "I2", "F1", "F2",
+    "N1", "B1", "P1", "T1", "G1",
+})
+
+
 def tier_of(league_key: str) -> int:
     return LEAGUE_TIERS.get(league_key, 5)
 
