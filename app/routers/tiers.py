@@ -163,7 +163,12 @@ async def get_available_days(sport: str = "football"):
 class TierPredictRequest(BaseModel):
     sport: str = "football"
     date: str  # "YYYY-MM-DD"
-    tiers: List[int]
+    tiers: List[int] = []
+    league_keys: Optional[List[str]] = None   # specific leagues to restrict to; takes
+                                               # precedence over `tiers` when given (lets
+                                               # the UI offer per-league selection, not
+                                               # just whole-tier, without losing the
+                                               # tier grouping leagues_in_tier() already has)
     markets: Optional[List[str]] = None       # db_market codes to include; None/empty = all
     selections: Optional[List[str]] = None    # specific line selections (e.g. "Over 2.5") to further filter within markets
     ml_model: Optional[str] = None            # None/"ensemble" = stored ensemble predictions; else one AVAILABLE_ML_MODELS id
@@ -229,14 +234,17 @@ async def predict_for_tiers(req: TierPredictRequest):
     restriction to avoid MLS/Liga MX's Jan-Dec calendar shifting the week
     numbering — a single calendar date has no such cross-league ambiguity,
     so every tiered league (not just the European anchors) is eligible."""
-    if not req.tiers:
-        raise HTTPException(status_code=400, detail="Select at least one tier")
+    if not req.tiers and not req.league_keys:
+        raise HTTPException(status_code=400, detail="Select at least one tier or league")
     if req.match_count < 1 or req.match_count > 50:
         raise HTTPException(status_code=400, detail="match_count must be between 1 and 50")
 
-    wanted_leagues = {k for k, v in LEAGUE_TIERS.items() if v in req.tiers}
+    if req.league_keys:
+        wanted_leagues = {k for k in req.league_keys if k in LEAGUE_TIERS}
+    else:
+        wanted_leagues = {k for k, v in LEAGUE_TIERS.items() if v in req.tiers}
     if not wanted_leagues:
-        raise HTTPException(status_code=400, detail="No leagues found for the requested tiers")
+        raise HTTPException(status_code=400, detail="No leagues found for the requested selection")
 
     supabase = get_supabase_admin()
     fixtures_res = (

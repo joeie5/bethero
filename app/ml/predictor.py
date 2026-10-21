@@ -47,6 +47,7 @@ import pandas as pd
 
 from app.ml.feature_engineer import FeatureEngineer
 from app.ml.models import StackingEnsemble, MODEL_DIR
+from app.ml.league_tiers import LEAGUE_TIERS
 
 logger = logging.getLogger(__name__)
 
@@ -346,7 +347,7 @@ class Predictor:
 
         q = (
             self.client.table("fixtures")
-            .select("sport, fixture_id")
+            .select("sport, fixture_id, league_key")
             .eq("status", "NS")
             .gte("match_date", today.isoformat())
             .lte("match_date", cutoff.isoformat())
@@ -355,7 +356,21 @@ class Predictor:
             q = q.eq("sport", sport)
 
         res = q.execute()
-        pairs = [(r["sport"], r["fixture_id"]) for r in (res.data or [])]
+        # Only football currently has a trained-league whitelist (CLAUDE.md
+        # §5 / app/ml/league_tiers.py's LEAGUE_TIERS, the 38 leagues the live
+        # models actually trained on) — other sports pass through unfiltered
+        # since they have no such scope defined yet. Confirmed live
+        # (2026-10-20): without this filter, API-Sports' free-tier "top +
+        # up to 200 other fixtures/day" ingestion silently generated
+        # predictions for untrained leagues (youth, reserve, friendlies,
+        # regional lower divisions) — 62% of all stored predictions before
+        # a one-off purge cleaned it up. This filter is what stops it from
+        # regrowing.
+        rows = [
+            r for r in (res.data or [])
+            if r["sport"] != "football" or r["league_key"] in LEAGUE_TIERS
+        ]
+        pairs = [(r["sport"], r["fixture_id"]) for r in rows]
         logger.info("Predicting %d upcoming fixtures …", len(pairs))
 
         all_results: list[PredictionResult] = []

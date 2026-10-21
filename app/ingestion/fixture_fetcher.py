@@ -17,6 +17,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from app.database import get_supabase_admin
 from app.ml.league_key_map import map_league_key
+from app.ml.league_tiers import LEAGUE_TIERS
 
 API_KEY = os.getenv("API_SPORTS_KEY", "")
 
@@ -33,10 +34,6 @@ _STATUS_MAP = {
     "PST": "PST", "CANC": "CANC", "ABD": "ABD", "AWD": "FT", "WO": "FT",
 }
 _FINISHED_STATUSES = {"FT"}
-
-TOP_LEAGUE_IDS = [
-    2, 3, 848, 39, 140, 78, 135, 61, 94, 88, 203, 144, 253, 292, 307, 188,
-]
 
 
 def map_football_fixture(f: dict) -> dict:
@@ -205,10 +202,23 @@ async def fetch_football_with_odds() -> int:
                     continue
 
                 all_fixtures = data.get("response", [])
-                top    = [f for f in all_fixtures if f.get("league", {}).get("id") in TOP_LEAGUE_IDS]
-                others = [f for f in all_fixtures if f.get("league", {}).get("id") not in TOP_LEAGUE_IDS]
-                fixtures_to_save = top + others[:200]
-                print(f"{date_str}: {len(top)} top league + {len(others)} other fixtures")
+                # Scoped to exactly the 38 league_keys the live models were
+                # trained on (app/ml/league_tiers.py's LEAGUE_TIERS, CLAUDE.md
+                # §5) — not "top leagues + up to 200 other fixtures/day" as
+                # before. That indiscriminate pull silently filled Supabase
+                # with fixtures/predictions for untrained leagues (youth,
+                # reserve, friendlies, regional lower divisions) — confirmed
+                # live (2026-10-20): 3,587 out-of-scope fixtures had produced
+                # 13,288 out-of-scope predictions (62% of the whole table)
+                # before a one-off purge. Do not widen this without the
+                # leagues being added to LEAGUE_TIERS first (i.e. the model
+                # actually being retrained on them) — see memory
+                # bethero-league-scope.
+                fixtures_to_save = [
+                    f for f in all_fixtures
+                    if map_league_key(str(f.get("league", {}).get("id", ""))) in LEAGUE_TIERS
+                ]
+                print(f"{date_str}: {len(fixtures_to_save)} in trained-league scope (of {len(all_fixtures)} total)")
 
                 for f in fixtures_to_save:
                     try:

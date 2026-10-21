@@ -165,7 +165,7 @@ class TierRepository {
 
   Future<TierPredictResult> predictForTiers({
     required String date,
-    required List<int> tiers,
+    required List<String> leagueKeys,
     required int matchCount,
     List<MarketOption>? marketOptions,
     String? mlModel,
@@ -179,7 +179,7 @@ class TierRepository {
     final response = await _api.dio.post('/tiers/predict', data: {
       'sport': sport,
       'date': date,
-      'tiers': tiers,
+      'league_keys': leagueKeys,
       if (markets != null && markets.isNotEmpty) 'markets': markets,
       if (selections != null && selections.isNotEmpty) 'selections': selections,
       if (mlModel != null && mlModel != 'ensemble') 'ml_model': mlModel,

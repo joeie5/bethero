@@ -24,11 +24,11 @@ final _mlModelsProvider = FutureProvider<List<MlModelOption>>((ref) {
 
 class _TierPredictArgs {
   final String date;
-  final List<int> tiers;
+  final List<String> leagueKeys;
   final List<MarketOption> marketOptions;
   final String mlModel;
   final int matchCount;
-  const _TierPredictArgs(this.date, this.tiers, this.marketOptions, this.mlModel, this.matchCount);
+  const _TierPredictArgs(this.date, this.leagueKeys, this.marketOptions, this.mlModel, this.matchCount);
 
   @override
   bool operator ==(Object other) {
@@ -38,8 +38,8 @@ class _TierPredictArgs {
     return other.date == date &&
         other.matchCount == matchCount &&
         other.mlModel == mlModel &&
-        other.tiers.length == tiers.length &&
-        other.tiers.every(tiers.contains) &&
+        other.leagueKeys.length == leagueKeys.length &&
+        other.leagueKeys.every(leagueKeys.contains) &&
         otherIds.length == ids.length &&
         otherIds.containsAll(ids);
   }
@@ -49,7 +49,7 @@ class _TierPredictArgs {
         date,
         matchCount,
         mlModel,
-        Object.hashAll(tiers.toList()..sort()),
+        Object.hashAll(leagueKeys.toList()..sort()),
         Object.hashAll(marketOptions.map((m) => m.id).toList()..sort()),
       );
 }
@@ -57,7 +57,7 @@ class _TierPredictArgs {
 final _tierPredictProvider = FutureProvider.family<TierPredictResult, _TierPredictArgs>((ref, args) {
   return ref.watch(tierRepositoryProvider).predictForTiers(
         date: args.date,
-        tiers: args.tiers,
+        leagueKeys: args.leagueKeys,
         marketOptions: args.marketOptions,
         mlModel: args.mlModel,
         matchCount: args.matchCount,
@@ -76,7 +76,8 @@ class TierPicksScreen extends ConsumerStatefulWidget {
 
 class _TierPicksScreenState extends ConsumerState<TierPicksScreen> {
   String? _selectedDate;
-  final Set<int> _selectedTiers = {1};
+  final Set<String> _selectedLeagueKeys = {};
+  bool _leagueDefaultsApplied = false;
   final Set<String> _selectedMarketIds = {};
   String _selectedMlModel = 'ensemble';
   int _matchCount = 10;
@@ -121,12 +122,17 @@ class _TierPicksScreenState extends ConsumerState<TierPicksScreen> {
             ),
             const SizedBox(height: 20),
 
-            const Text('LEAGUE TIER', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, letterSpacing: 0.6, color: AppColors.inkMuted)),
+            const Text('LEAGUES', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, letterSpacing: 0.6, color: AppColors.inkMuted)),
+            const SizedBox(height: 4),
+            const Text(
+              'Grouped by quality tier. Pick individual leagues by name, or use "All" to grab a whole tier at once.',
+              style: TextStyle(fontSize: 11, height: 1.4, color: AppColors.inkFaint),
+            ),
             const SizedBox(height: 8),
             tierGroupsAsync.when(
               loading: () => const Padding(padding: EdgeInsets.symmetric(vertical: 12), child: LinearProgressIndicator()),
-              error: (e, _) => Text('Couldn\'t load tiers: $e', style: const TextStyle(color: AppColors.loss, fontSize: 12)),
-              data: (groups) => _tierPicker(groups),
+              error: (e, _) => Text('Couldn\'t load leagues: $e', style: const TextStyle(color: AppColors.loss, fontSize: 12)),
+              data: (groups) => _leaguePicker(groups),
             ),
             const SizedBox(height: 20),
 
@@ -181,20 +187,20 @@ class _TierPicksScreenState extends ConsumerState<TierPicksScreen> {
               label: 'Get predictions',
               full: true,
               onPressed: _selectedDate == null ||
-                      _selectedTiers.isEmpty ||
+                      _selectedLeagueKeys.isEmpty ||
                       (_selectedMlModel != 'ensemble' && _selectedMarketIds.isEmpty)
                   ? null
                   : () => setState(() => _searched = true),
             ),
             const SizedBox(height: 20),
 
-            if (_searched && _selectedDate != null && _selectedTiers.isNotEmpty)
+            if (_searched && _selectedDate != null && _selectedLeagueKeys.isNotEmpty)
               marketsAsync.when(
                 loading: () => const SizedBox.shrink(),
                 error: (e, _) => const SizedBox.shrink(),
                 data: (allMarkets) => _resultsSection(_TierPredictArgs(
                   _selectedDate!,
-                  _selectedTiers.toList(),
+                  _selectedLeagueKeys.toList(),
                   allMarkets.where((m) => _selectedMarketIds.contains(m.id)).toList(),
                   _selectedMlModel,
                   _matchCount,
@@ -243,96 +249,257 @@ class _TierPicksScreenState extends ConsumerState<TierPicksScreen> {
     );
   }
 
-  Widget _tierPicker(List<TierGroup> groups) {
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      children: groups.map((g) {
-        final active = _selectedTiers.contains(g.tier);
-        return FilterChip(
-          label: Text('Tier ${g.tier} (${g.leagues.length})'),
-          selected: active,
-          onSelected: (sel) => setState(() {
-            if (sel) {
-              _selectedTiers.add(g.tier);
-            } else {
-              _selectedTiers.remove(g.tier);
-            }
-            _searched = false;
-          }),
-          labelStyle: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: active ? AppColors.base : AppColors.inkMuted),
-          selectedColor: AppColors.gold,
-          backgroundColor: Colors.white.withOpacity(0.05),
-          side: BorderSide(color: Colors.white.withOpacity(0.08)),
+  Widget _leaguePicker(List<TierGroup> groups) {
+    // Default to every Tier-1 league selected the first time data loads —
+    // matches the old default (Tier 1 pre-selected) without forcing it back
+    // on after the user has made their own choice.
+    if (!_leagueDefaultsApplied) {
+      _leagueDefaultsApplied = true;
+      final tier1 = groups.where((g) => g.tier == 1).expand((g) => g.leagues);
+      _selectedLeagueKeys.addAll(tier1.map((l) => l.leagueKey));
+    }
+
+    return Column(
+      children: [
+        for (final g in groups) ...[
+          if (g != groups.first) const SizedBox(height: 10),
+          _tierDropdown(g),
+        ],
+      ],
+    );
+  }
+
+  /// A closed-by-default "select" for one tier — tap to open a checklist
+  /// "options" sheet where any number of that tier's leagues can be ticked.
+  Widget _tierDropdown(TierGroup g) {
+    final selectedCount = g.leagues.where((l) => _selectedLeagueKeys.contains(l.leagueKey)).length;
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: () => _openLeagueOptions(g),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.05),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.white.withOpacity(0.08)),
+        ),
+        child: Row(
+          children: [
+            Text('Tier ${g.tier}', style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.ink)),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                selectedCount == 0
+                    ? '${g.leagues.length} leagues — tap to pick'
+                    : '$selectedCount of ${g.leagues.length} selected',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: selectedCount == 0 ? AppColors.inkFaint : AppColors.gold),
+              ),
+            ),
+            const Icon(Icons.expand_more, size: 20, color: AppColors.inkFaint),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openLeagueOptions(TierGroup g) async {
+    final keys = g.leagues.map((l) => l.leagueKey).toSet();
+    await showModalBottomSheet(
+      context: context,
+      backgroundColor: AppColors.base,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (sheetContext, setSheetState) {
+            final allSelected = keys.isNotEmpty && keys.every(_selectedLeagueKeys.contains);
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Text('Tier ${g.tier} leagues', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: AppColors.ink)),
+                        const Spacer(),
+                        TextButton(
+                          onPressed: () {
+                            setSheetState(() {
+                              setState(() {
+                                if (allSelected) {
+                                  _selectedLeagueKeys.removeAll(keys);
+                                } else {
+                                  _selectedLeagueKeys.addAll(keys);
+                                }
+                                _searched = false;
+                              });
+                            });
+                          },
+                          child: Text(allSelected ? 'Clear all' : 'Select all'),
+                        ),
+                      ],
+                    ),
+                    Flexible(
+                      child: ListView(
+                        shrinkWrap: true,
+                        children: g.leagues.map((l) {
+                          final checked = _selectedLeagueKeys.contains(l.leagueKey);
+                          return CheckboxListTile(
+                            value: checked,
+                            onChanged: (sel) {
+                              setSheetState(() {
+                                setState(() {
+                                  if (sel ?? false) {
+                                    _selectedLeagueKeys.add(l.leagueKey);
+                                  } else {
+                                    _selectedLeagueKeys.remove(l.leagueKey);
+                                  }
+                                  _searched = false;
+                                });
+                              });
+                            },
+                            title: Text(l.leagueName, style: const TextStyle(fontSize: 14, color: AppColors.ink)),
+                            activeColor: AppColors.gold,
+                            checkColor: AppColors.base,
+                            controlAffinity: ListTileControlAffinity.leading,
+                            contentPadding: EdgeInsets.zero,
+                            dense: true,
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    AppButton(label: 'Done', full: true, onPressed: () => Navigator.of(sheetContext).pop()),
+                  ],
+                ),
+              ),
+            );
+          },
         );
-      }).toList(),
+      },
     );
   }
 
   Widget _marketPicker(List<MarketOption> markets) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: () => _openMarketOptions(markets),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.05),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.white.withOpacity(0.08)),
+        ),
+        child: Row(
+          children: [
+            const Text('Markets', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w700, color: AppColors.ink)),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                _selectedMarketIds.isEmpty ? 'All markets — tap to narrow' : '${_selectedMarketIds.length} selected',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: _selectedMarketIds.isEmpty ? AppColors.inkFaint : AppColors.gold),
+              ),
+            ),
+            const Icon(Icons.expand_more, size: 20, color: AppColors.inkFaint),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openMarketOptions(List<MarketOption> markets) async {
     // Group by market so Goals/Corners show their individual lines under one
-    // heading instead of one flat "Goals" chip that hides which line it means.
+    // heading instead of one flat list that hides which line is which.
     final byMarket = <String, List<MarketOption>>{};
     for (final m in markets) {
       byMarket.putIfAbsent(m.market, () => []).add(m);
     }
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            FilterChip(
-              label: const Text('All'),
-              selected: _selectedMarketIds.isEmpty,
-              onSelected: (_) => setState(() {
-                _selectedMarketIds.clear();
-                _searched = false;
-              }),
-              labelStyle: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: _selectedMarketIds.isEmpty ? AppColors.base : AppColors.inkMuted),
-              selectedColor: AppColors.gold,
-              backgroundColor: Colors.white.withOpacity(0.05),
-              side: BorderSide(color: Colors.white.withOpacity(0.08)),
-            ),
-          ],
-        ),
-        for (final entry in byMarket.entries) ...[
-          const SizedBox(height: 10),
-          if (entry.value.length > 1)
-            Padding(
-              padding: const EdgeInsets.only(bottom: 6),
-              child: Text(
-                entry.value.first.label.split(':').first.toUpperCase(),
-                style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w700, letterSpacing: 0.6, color: AppColors.inkFaint),
+    await showModalBottomSheet(
+      context: context,
+      backgroundColor: AppColors.base,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (sheetContext, setSheetState) {
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Text('Markets', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800, color: AppColors.ink)),
+                        const Spacer(),
+                        TextButton(
+                          onPressed: _selectedMarketIds.isEmpty
+                              ? null
+                              : () {
+                                  setSheetState(() {
+                                    setState(() {
+                                      _selectedMarketIds.clear();
+                                      _searched = false;
+                                    });
+                                  });
+                                },
+                          child: const Text('All markets'),
+                        ),
+                      ],
+                    ),
+                    Flexible(
+                      child: ListView(
+                        shrinkWrap: true,
+                        children: [
+                          for (final entry in byMarket.entries) ...[
+                            if (entry.value.length > 1)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 10, bottom: 2),
+                                child: Text(
+                                  entry.value.first.label.split(':').first.toUpperCase(),
+                                  style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w700, letterSpacing: 0.6, color: AppColors.inkFaint),
+                                ),
+                              ),
+                            for (final m in entry.value)
+                              CheckboxListTile(
+                                value: _selectedMarketIds.contains(m.id),
+                                onChanged: (sel) {
+                                  setSheetState(() {
+                                    setState(() {
+                                      if (sel ?? false) {
+                                        _selectedMarketIds.add(m.id);
+                                      } else {
+                                        _selectedMarketIds.remove(m.id);
+                                      }
+                                      _searched = false;
+                                    });
+                                  });
+                                },
+                                title: Text(m.selection ?? m.label, style: const TextStyle(fontSize: 14, color: AppColors.ink)),
+                                activeColor: AppColors.gold,
+                                checkColor: AppColors.base,
+                                controlAffinity: ListTileControlAffinity.leading,
+                                contentPadding: EdgeInsets.zero,
+                                dense: true,
+                              ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    AppButton(label: 'Done', full: true, onPressed: () => Navigator.of(sheetContext).pop()),
+                  ],
+                ),
               ),
-            ),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: entry.value.map((m) {
-              final active = _selectedMarketIds.contains(m.id);
-              return FilterChip(
-                label: Text(m.selection ?? m.label),
-                selected: active,
-                onSelected: (sel) => setState(() {
-                  if (sel) {
-                    _selectedMarketIds.add(m.id);
-                  } else {
-                    _selectedMarketIds.remove(m.id);
-                  }
-                  _searched = false;
-                }),
-                labelStyle: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: active ? AppColors.base : AppColors.inkMuted),
-                selectedColor: AppColors.gold,
-                backgroundColor: Colors.white.withOpacity(0.05),
-                side: BorderSide(color: Colors.white.withOpacity(0.08)),
-              );
-            }).toList(),
-          ),
-        ],
-      ],
+            );
+          },
+        );
+      },
     );
   }
 
@@ -468,9 +635,6 @@ class _TierPicksScreenState extends ConsumerState<TierPicksScreen> {
                       ],
                     ],
                   ),
-                  if (p.actualOutcome != null)
-                    Text('Actual: ${p.actualOutcome}',
-                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: resultColor)),
                 ],
               ),
             ),
@@ -483,6 +647,9 @@ class _TierPicksScreenState extends ConsumerState<TierPicksScreen> {
                 if (p.status != 'pending')
                   Text(p.status == 'won' ? 'Won' : 'Lost',
                       style: TextStyle(fontSize: 10, fontWeight: FontWeight.w700, color: resultColor)),
+                if (p.actualOutcome != null)
+                  Text('Actual: ${p.actualOutcome}',
+                      style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600, color: resultColor)),
               ],
             ),
           ],
